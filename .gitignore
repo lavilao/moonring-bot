@@ -1,0 +1,7 @@
+work/
+vendor/
+logs/
+*.log
+.qoder/
+__pycache__/
+*.persist
