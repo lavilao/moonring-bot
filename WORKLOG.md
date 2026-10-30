@@ -551,3 +551,13 @@ decodificado y `archonDungeon-01Triggers.csv`.
   pisar `plateOff` la convierte en `plateOn` y transforma las puertas con el
   mismo código (`unlockTileData`), borrando sus triggers; después basta
   empujar la puerta ya `doorClosed`.
+
+### Test35/test36 — salir de la cueva con vida
+
+Test35 (sonda del save del usuario, 420 s): el bot tenía la llave maestra y
+murió en 68,53 mientras "barría" fronteras restantes con 6 PV, sin pociones,
+sin cargas de lifestone y con el poise roto. Arreglo: el barrido posterior a
+la llave (`exit-explore`) solo se hace si hay vida > 60 % y alguna fuente de
+curación (poción o lifestone); si no, va directo a las escaleras de salida.
+Test36 arrancó desde el checkpoint del save del usuario (Overworld 267,223),
+entró a Moon-upon-Thoss y siguió a la mazmorra sin errores.

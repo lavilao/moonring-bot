@@ -2780,11 +2780,17 @@ local function tickWorld(game, player)
     end
     -- The key opens the way out but does not finish the run: sweep the rest
     -- of the level first so loot and unexplored rooms are not left behind.
-    local fx, fy, steps = findFrontier(game, player)
-    if fx and steps and steps[1] then
-      S.phase = "exit-explore"
-      pressDelta(steps[1].x, steps[1].y)
-      return
+    -- Only while there is healing left to survive the detour; a wounded run
+    -- with no potions and no Lifestone charge goes straight for the exit.
+    local canSweep = player.health > player.maxHealth * 0.6
+      and (potionInfo(player) > 0 or lsUses(findLifestone(player)) > 0)
+    if canSweep then
+      local fx, fy, steps = findFrontier(game, player)
+      if fx and steps and steps[1] then
+        S.phase = "exit-explore"
+        pressDelta(steps[1].x, steps[1].y)
+        return
+      end
     end
     local ex, ey = dungeonExitXY(game)
     if ex then
