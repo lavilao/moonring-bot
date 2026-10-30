@@ -2516,6 +2516,35 @@ local function townSupplyStep(game, player)
   return false
 end
 
+-- Sleep at an inn when wounded before entering a dungeon. Stepping on an
+-- inn_bed trigger and pressing return opens the Rest choice; handleDialogs
+-- pays for it, and the sleep both heals and feeds the character.
+local function innRestStep(game, player)
+  if player.health >= player.maxHealth then return false end
+  if game.isSleeping then return true end
+  if game.speechArea and game.speechArea:isPropertyNonZero("killed_tether") then
+    return false
+  end
+  local beds = game.triggerData:getAllTriggersOnLevelWithActionName(
+    game.currentWorldName, "inn_bed") or {}
+  local best, bestLen
+  for _, b in ipairs(beds) do
+    local mx, my = game.map:convertWorldXYToMapXYZeroIndexed(b.x, b.y)
+    local steps = travelSteps(game, player, mx, my)
+    if steps and (bestLen == nil or #steps < bestLen) then
+      best, bestLen = steps, #steps
+    end
+  end
+  if not best then return false end
+  if bestLen == 0 then
+    pressKey("return")
+    log("resting at inn (hp %d/%d)", player.health, player.maxHealth)
+  else
+    pressDelta(best[1].x, best[1].y)
+  end
+  return true
+end
+
 local function handleDialogs(game)
   if S.tearPending and game.multiChoiceBox and game.multiChoiceBox.isOpen then
     S.tearPending = false
@@ -2750,6 +2779,10 @@ local function tickWorld(game, player)
     end
 
     if delve then
+      if innRestStep(game, player) then
+        S.phase = "inn-rest"
+        return
+      end
       if townSupplyStep(game, player) then
         S.phase = "town-supplies"
         return
@@ -3136,6 +3169,14 @@ local function checkGlobal()
       tostring(cx), tostring(cy),
       tostring(minor and minor.count or 0), tostring(major and major.count or 0),
       tostring(stone and stone.durability or 0), S.phase, S.knownCount)
+    pcall(function()
+      local ps = game:getPlayerStats()
+      log("stats money=%s str=%s fin=%s int=%s per=%s end=%s dev(%s)=%s following=%s",
+        tostring(ps.money), tostring(ps.strength), tostring(ps.finesse),
+        tostring(ps.intellect), tostring(ps.perception), tostring(ps.endurance),
+        tostring(CFG.god), tostring(game:getDevotion(CFG.god)),
+        tostring(game:getCurrentGod()))
+    end)
     dumpMap(game, "beat")
   end
 end

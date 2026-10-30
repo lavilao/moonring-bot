@@ -585,3 +585,17 @@ huye (la restricción de Wolf es huir; la de Dust, pociones; la de Harlequin
 solo prohíbe hachas/espadas/mazas y mejora ganzúa/dodge/evasión de trampas).
 Pendiente: equipamiento debe respetar el tabú (no equipar espadas/mazas), y
 buscar Devotional Tears en mazmorras para comprar más Gifts.
+
+### Estrategia tras test37: la mazmorra 2 es inviable sin Gifts
+
+El modelo de combate da ~100 % de muerte contra dos Nomans (need 3119, res
+1050 con daga). El usuario lo confirmó: sin subir atributos/habilidades la
+mazmorra 2 es matemáticamente imposible. Mecánica de progresión confirmada en
+el código: cada punto de Devoción sube +5 el atributo del dios, y cada Gift
+comprado también (+5). Fuentes de Devoción: Devotional Tears (objetos raros de
+mazmorra/relic), y Devotional Tasks = logros de `achievements.lua` (2 de
+devoción cada uno; p. ej. "visitar la ciudad natal de cada dios", "derrotar 50
+enemigos", "sufrir 13 estados alterados"). El bot ya dedica (boon + cura full)
+y compra Gifts cuando tiene devoción; falta farmear devoción.
+Añadido: descanso en cama de posada en pueblo cuando hp < max antes de entrar
+a la mazmorra, y log de money/stats/devoción por beat para medir la debilidad.
