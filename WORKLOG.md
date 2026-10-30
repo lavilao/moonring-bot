@@ -436,3 +436,118 @@ mordiscos de 188–266).
 - No se podía desenganchar estando adyacente: `avoid` huye si `allOut`, aunque
   haya enemigo pegado.
 - Inventario: el diagnóstico ya vuelca `inv=[...]` correctamente.
+
+## 10. Modelo probabilístico de combate (2026-10-27)
+
+Sustituye al subagente anterior por un simulador propio, verificado contra el
+código del juego. Módulo `mod/zzbot/model.lua`, tests en `tools/test_model.lua`
+(11/11 PASS).
+
+### Mecánicas verificadas en el código del juego
+
+- **Poise**: máximo 200; mientras `poise > 0` un golpe se absorbe ENTERO, sin
+  derrame; cualquier daño resetea `timeSinceLastInjured`; regenera
+  `0.0125*maxPoise`/ut tras 36 ut sin daño y solo sin enemigo adyacente. No hay
+  regeneración de vida.
+- **Veneno**: no es DOT. `poisonMelee` acumula un medidor (hornet 0.15/golpe);
+  al llegar a 1 se pierde `ceil(0.5*HP actual)` de golpe, ignora poise, NO puede
+  matar (se queda a 1 PV) y el medidor vuelve a 0 (`actor.lua:4058-4066`,
+  `8515`). Decae `0.00125`/ut tras 10 ut.
+- **Daño**: `ceil((r1+r2)*0.5)` con r1,r2 ∈ [ceil(d*(1-var)), d] → triangular
+  alrededor de `d*(1-var/2)`; crítico x2; `applyCurveToDamage` interpola
+  `[d, 2d]` según stat/35.
+- **Invocadores**: `summonHornets` cuesta 100 de energía, cd 200 ut, 24 ut de
+  acción; el nido regenera 0.00025/tick → una invocación real cada ~4000 ut;
+  invoca 2-4 hornets o 1 reina (1/6) con 6 ut de retraso.
+- **Reloj**: cada acción del jugador da a todos los enemigos su tiempo; los
+  enemigos actúan al acumular `availableTime > 0` (pagan después). El primer
+  mordisco adyacente se modela en t=0.
+
+### Arquitectura del modelo
+
+- Monte Carlo N=96 por acción, horizonte 600 ut, números aleatorios comunes
+  (misma semilla por trial para todas las acciones) → comparación pareada.
+- RNG minstd con un único uniforme por golpe invertido contra la CDF exacta de
+  Bates(3) (tabla de 512 puntos); sumar 3 salidas consecutivas del LCG
+  subestimaba las colas (~4.5% vs 11% teórico).
+- Política de referencia del rollout: atacar solo adyacentes (invocador
+  primero), cerrar distancia si no hay nadie pegado, mantener embudo si
+  `choke`.
+- Decisión: menor cota superior de Wilson al 95% de `pDeath`, luego `pDeath`,
+  luego vida media, luego coste de recursos, luego duración. Si todas las
+  opciones mueren al 100%, gana la que más tarda en morir.
+- La acción `flee` simula pasos reales; escapar exige que TODOS los enemigos
+  queden a gap>1 y sean más lentos (`allOutrun`).
+
+### Bugs de decisión encontrados en test24 (muerte en 63,42)
+
+1. **Lifestone curando 0**: la opción se creaba con `healAmount=0` a vida llena
+   y, al ser la única acción con un enemigo aún lejano, se eligió 5 veces
+   (`charges 10→0`) sin curar nada. Arreglado: `Gp > 0` obligatorio y el modelo
+   solo decide cuando hay enemigo adyacente (`#adj > 0`); a distancia decide la
+   capa de movimiento.
+2. **Sin huida al 100% de muerte**: `findFleeCell` exige una celda a distancia
+   ≥2 de todo enemigo; en un callejón corto devolvía nil y el bot atacaba con
+   `d=100%`. Arreglado: `desperateEscapeCell` ofrece el vecino transitable más
+   lejano de todo hostil visible (opción `retreat` de 1 paso), y `doFlee` la usa
+   como fallback.
+
+### Resultados headless del modelo
+
+| Test | Resultado | Lectura |
+|---|---|---|
+| test24 | muerte turno 2837 en 63,42 | Lifestone a 0 PV ×5 y ataque al 100% sin opción de huida |
+| test25 | muerte turno 5109 en 54,23 | ya no desperdicia curas; huyó de un lobo hacia el nido de avispas |
+| test26 | muerte turno 3231 en 68,44 | sin vecino transitable (callejón); 1v1 real contra silverwolf |
+
+Test25 expuso que `findFleeCell` solo miraba la distancia a enemigos
+visibles, no si la huida entraba en territorio sin explorar: el bot arrastró
+un lobo durante ~15 turnos hasta el nido. Arreglado con penalización por
+vecinos desconocidos (+4 por celda) en el destino de huida, y con una regla
+de decisión: la huida solo se ofrece si el veredicto del pack es `avoid`, si
+la vida está por debajo del 30 %, o si ya se tiene la llave (desenganche
+post-llave). Un lobo adyacente que se puede matar se mata; huir de él a vida
+llena es un treadmill que acumula perseguidores.
+
+Test26 murió en un callejón sin salida: el modelo valoró el 1v1 contra un
+silverwolf en 60-100 % de muerte (daga inicial, poise 0, sin pociones) y no
+había ninguna celda transitable a la que retirarse. La predicción era
+correcta; el error fue estratégico (entrar en territorio de lobos sin equipo).
+La siguiente línea de trabajo es loot/equipo y progresión, no más parches al
+combate básico.
+
+## 2026-10-30 — Beneath the Keep: exploración tras cajas y puertas secretas
+
+### Causa del bloqueo en test33 (archonDungeon-01)
+
+La bóveda de entrada (filas 63-72) solo tiene una salida al norte: una celda
+`secretDoor` en 47,62 detrás de una fila de `crateOpen` (48..54,64). Ni
+`findFrontier` ni `findRoutableDoor` recorrían cajas/barriles (no son
+`isWalkable`, solo rompibles al empujarlos) ni puertas secretas (parecen muro
+hasta que se empujan), así que el bot se quedaba en `phase=stuck` con
+"no frontier and no key" hasta el timeout. Verificado con el PNG del mapa
+decodificado y `archonDungeon-01Triggers.csv`.
+
+### Cambios en `mod/zzbot/init.lua`
+
+- `findFrontier` y `findRoutableDoor` ahora recorren `isPassableForPath`
+  (incluye cajas/barriles rompibles y puertas secretas).
+- `lockedDoorPlan`: clasifica cada puerta `locked_door` por su trigger:
+  - data string → `key:<item>` (bump si se lleva el ítem),
+  - data numérico >0 → `plate:<code>` (hay que pisar la placa
+    `fnUnlockWithPlate` con ese código),
+  - data 0 → `sealed` (solo `key_master` o trigger `unlock`),
+  - sin trigger → `pick` (ganzúa; `doorLocked2` nunca es forzable).
+  `findRoutableDoor` ignora puertas que ahora mismo no se pueden abrir y
+  `tryOpenDoor` usa `pickLock` cuando corresponde.
+- `doorObjectiveStep`: si no queda frontera ni puerta abrible, va a la placa
+  que corresponde al código o a por la llave (portador visible o contenedor).
+- `trySecretDoorSweep`: cuando el juego marca `gotFeelingAboutSecretDoor`
+  (hay una puerta secreta adyacente), empuja los muros vecinos (con lista
+  negra de lava/fuego/etc. y enfriamiento de 3 s por celda).
+- Capturas: `ZZBOT_SHOT_INTERVAL=n` guarda `zzshot-NNN.png` en el directorio
+  de guardado; al quedarse atascado guarda `zzshot-stuck.png` una vez.
+- Mecánica de placas confirmada en `state_game.lua:13960` (`fnUnlockWithPlate`):
+  pisar `plateOff` la convierte en `plateOn` y transforma las puertas con el
+  mismo código (`unlockTileData`), borrando sus triggers; después basta
+  empujar la puerta ya `doorClosed`.

@@ -1,6 +1,6 @@
--- zzbot: autonomous explorer for Moonring.
--- Goal: start a fresh game, walk from Yarrow to Yarrow Cave, get the master
--- key, then leave the dungeon through its entrance.
+-- zzbot: autonomous campaign runner for Moonring.
+-- Clears each town's dungeon in guide order, loots before leaving, and travels
+-- the overworld to the next town.
 --
 -- All work happens on an isolated save (XDG_DATA_HOME is set by tools/run.sh).
 
@@ -19,10 +19,12 @@ local CFG = {
   autostart = (os.getenv("ZZBOT_AUTOSTART") == "1"),
   startOn   = (os.getenv("ZZBOT_START_ON") == "1"),
   toggleKey = os.getenv("ZZBOT_TOGGLE") or "f9",
-  model     = (os.getenv("ZZBOT_MODEL") ~= "0"),
+  model     = (os.getenv("ZZBOT_MODEL") == "1"),
   modelN    = tonumber(os.getenv("ZZBOT_MODEL_N")) or 64,
   alpha     = tonumber(os.getenv("ZZBOT_ALPHA")) or 0.08,
   horizon   = tonumber(os.getenv("ZZBOT_HORIZON")) or 480,
+  startTown = tonumber(os.getenv("ZZBOT_START_TOWN")),
+  shotEvery = tonumber(os.getenv("ZZBOT_SHOT_INTERVAL")),
 }
 
 local S = {
@@ -47,6 +49,9 @@ local S = {
   lastLSTurn = -1000,
   hasKey = false,
   masterKeyLogged = false,
+  townIndex = CFG.startTown or 1,
+  nextTown = nil,
+  dungeonDone = {},
   lastHP = nil,
   stuckSince = nil,
   lastBeat = 0,
@@ -133,6 +138,22 @@ local function cellAt(map, x, y)
   return map.cells[y + 1] and map.cells[y + 1][x + 1]
 end
 
+-- The overworld is drawn as a 96x96 chunk viewport around the camera, so map
+-- coordinates there are camera-relative; everywhere else map == world coords.
+local function toMapXY(game, x, y)
+  if game:isWorldOutside() then
+    return game.map:convertWorldXYToMapXYZeroIndexed(x, y)
+  end
+  return x, y
+end
+
+local function toWorldXY(game, x, y)
+  if game:isWorldOutside() then
+    return game.map:convertMapXYToWorldXY(x, y)
+  end
+  return x, y
+end
+
 local function cellWalkable(cell)
   if not cell then return false end
   local data = CCellData and CCellData.cellTypeArray[cell.typeIndex]
@@ -168,6 +189,50 @@ end
 
 local function isPassableForPath(cell)
   return cellWalkable(cell) or isBumpableObstacleName(cellTypeName(cell))
+end
+
+-- One movement delta toward world (wx, wy) on the overworld. The BFS runs over
+-- the chunk viewport in map coordinates and aims for the reachable cell closest
+-- to the target, so a target outside the viewport still yields progress while
+-- rivers and mountains inside the viewport are routed around.
+local function outsideStep(game, player, wx, wy)
+  if not game:isWorldOutside() then return nil end
+  local map = game.map
+  local sx, sy = toMapXY(game, player.position.x, player.position.y)
+  if not map:isPositionInMapXYZeroIndexed(sx, sy) then return nil end
+  local startK = ckey(sx, sy)
+  local queue = { startK }
+  local parent = { [startK] = false }
+  local head = 1
+  local bestK, bestD = nil, math.huge
+  while head <= #queue do
+    local k = queue[head]
+    head = head + 1
+    local cx, cy = k % 10000, math.floor(k / 10000)
+    local cxw, cyw = toWorldXY(game, cx, cy)
+    local d = math.max(math.abs(cxw - wx), math.abs(cyw - wy))
+    if d < bestD then bestD, bestK = d, k end
+    if d == 0 then break end
+    for _, dir in ipairs(DIRS) do
+      local nx, ny = cx + dir[1], cy + dir[2]
+      if map:isPositionInMapXYZeroIndexed(nx, ny) then
+        local nk = ckey(nx, ny)
+        if parent[nk] == nil and isPassableForPath(cellAt(map, nx, ny)) then
+          parent[nk] = k
+          queue[#queue + 1] = nk
+        end
+      end
+    end
+  end
+  if not bestK or bestK == startK then return nil end
+  local k = bestK
+  local prev = parent[k]
+  while prev and prev ~= startK do
+    k = prev
+    prev = parent[k]
+  end
+  local nx, ny = k % 10000, math.floor(k / 10000)
+  return nx - sx, ny - sy
 end
 
 -- Breadth-first path over the real map. Doors count as passable so the bot can
@@ -389,6 +454,21 @@ local function playerPos(player)
   return player.position.x, player.position.y
 end
 
+-- Locked doors are not opened by bumping: the game needs a lockpick (or a
+-- pressure plate / unlock event). doorLocked2 is explicitly unpickable.
+local LOCKED_DOOR_CELLS = { doorLocked = true, gateLocked = true }
+
+local function tryPickLock(game, player, x, y)
+  local item = player:findInventoryObjectWithName("lockpick")
+  if not item or (item.durability or 0) <= 0 then return false end
+  local dx, dy = x - player.position.x, y - player.position.y
+  if math.abs(dx) + math.abs(dy) ~= 1 then return false end
+  log("lockpick on door at %d,%d (durability %s)", x, y, tostring(item.durability))
+  player.targetDirection:set(dx, dy)
+  player:performActionWithNameAndTargets("pickLock", {}, nil, item)
+  return true
+end
+
 -- Remember every cell we have ever seen. Fog of war clears isRemembered as the
 -- player looks away, so keeping our own set avoids re-exploring old rooms.
 local function updateKnown(game, player)
@@ -437,7 +517,11 @@ local function findFrontier(game, player)
             isFrontier = true
           else
             local nk = ckey(nx, ny)
-            if not seen[nk] and cellWalkable(cellAt(map, nx, ny))
+            -- Crates and barrels are not walkable but can be broken by
+            -- bumping, and secret doors look like walls until touched. They
+            -- must count as passable or whole rooms behind them are invisible
+            -- to the frontier search.
+            if not seen[nk] and isPassableForPath(cellAt(map, nx, ny))
               and not (danger and danger[nk]) then
               seen[nk] = true
               queue[#queue + 1] = { nx, ny }
@@ -457,7 +541,9 @@ local function findFrontier(game, player)
     end
   end
 
-  return search(S.avoidDanger) or search(nil)
+  local fx, fy, steps = search(S.avoidDanger)
+  if fx then return fx, fy, steps end
+  return search(nil)
 end
 
 local function travelSteps(game, player, tx, ty, avoidActors, avoidWeb)
@@ -478,6 +564,11 @@ local function moveToward(game, player, tx, ty)
   local steps = travelSteps(game, player, tx, ty, true)
     or travelSteps(game, player, tx, ty, false)
   if steps and steps[1] then
+    local nx, ny = px + steps[1].x, py + steps[1].y
+    if LOCKED_DOOR_CELLS[cellTypeName(cellAt(game.map, nx, ny))]
+      and tryPickLock(game, player, nx, ny) then
+      return "moving"
+    end
     pressDelta(steps[1].x, steps[1].y)
     return "moving"
   end
@@ -657,6 +748,10 @@ local function playerProfile(game, player)
   end)
   pcall(function() prof.dodge = math.min(0.9, game:getPlayerDodge() or 0) end)
   pcall(function()
+    local _, _, _, _, _, _, _, pd = player:getAllStatusEffectDefStats()
+    prof.poisonResist = math.min(1, math.max(0, (pd or 0) / 100))
+  end)
+  pcall(function()
     prof.speed = (player.actorData.moveSpeed or 1)
       / math.max(0.1, game:getPlayerTickCostMultiplier() or 1)
   end)
@@ -681,8 +776,8 @@ end
 -- time-to-kill is per enemy rather than one global player DPS.
 -- Creatures that can call reinforcements keep feeding the fight, so the
 -- spawner is worth killing even when its own damage is negligible.
-local function summonerProfile(data)
-  local found, cooldown = false, nil
+local function summonerProfile(a, data)
+  local found, interval, ready = false, nil, true
   for _, key in ipairs({ "offensiveActions", "supportActions" }) do
     local list = data[key]
     if type(list) == "table" then
@@ -693,20 +788,28 @@ local function summonerProfile(data)
           pcall(function()
             ad = (CActions.static and CActions.static.data[n]) or CActions.data[n]
           end)
-          local cd = ad and tonumber(ad.cooldown) or nil
-          if cd and cd > 0 then
-            cooldown = math.min(cooldown or cd, cd)
+          if ad then
+            local cd = tonumber(ad.cooldown) or 0
+            local ec = tonumber(ad.energyCost) or 0
+            local en = tonumber(data.energy) or 0
+            -- Energy, not the action cooldown, is the real limiter: enemies
+            -- regain 0.00025*maxEnergy per ut (actor_manager.lua:1322), so a
+            -- 100-energy summon needs ~4000 ut to recharge.
+            local need = (ec > 0 and en > 0) and ec / (en * 0.00025) or 0
+            local iv = math.max(cd, need, 1)
+            interval = math.min(interval or iv, iv)
+            if ec > 0 and a and a.energy and a.energy < ec then ready = false end
           end
         end
       end
     end
   end
-  return found, cooldown or 200
+  return found, interval or 200, ready
 end
 
 local function enemyWeight(game, a, prof)
   local data = a.actorData or {}
-  local summoner, summonCooldown = summonerProfile(data)
+  local summoner, summonCooldown, summonReady = summonerProfile(a, data)
   local w = {
     actor = a,
     actorType = a.actorType or data.actorType,
@@ -717,6 +820,7 @@ local function enemyWeight(game, a, prof)
     carrier = carriesChestKey(a),
     summoner = summoner,
     summonCooldown = summonCooldown,
+    summonReady = summonReady,
     dodge = data.dodge or 0,
     dist = math.huge,
     maxHit = 0,
@@ -757,6 +861,18 @@ local function enemyWeight(game, a, prof)
     -- top of the range; this is what decides whether one swing is lethal.
     local meanFactor = (1 - variance * 0.5) * (1 + crit * (critMult - 1))
     w.maxHit = hit / math.max(1e-6, meanFactor) * critMult
+  end
+
+  -- The model simulates poison explicitly (it bypasses poise and halves
+  -- current health), so strip the legacy heuristic multiplier from the
+  -- damage it sees while keeping it for the heuristic fallback.
+  w.poisonPerHit, w.modelHit, w.modelMaxHit = 0, w.hit, w.maxHit
+  if wd and (wd.poisonMelee or 0) > 0 then
+    w.poisonPerHit = wd.poisonMelee * (1 - (prof.dodge or 0))
+      * (1 - (prof.poisonResist or 0))
+    local pm = 1 + wd.poisonMelee * 3
+    w.modelHit = w.hit / pm
+    w.modelMaxHit = w.maxHit / pm
   end
 
   local defFrac = 1
@@ -960,7 +1076,17 @@ local function findFleeCell(game, player)
         if d < nearest then nearest = d end
       end
       if nearest >= 2 then
-        local score = cd - nearest * 2
+        -- Prefer explored ground: fleeing into unseen rooms is how test25
+        -- kited one wolf straight into the wasp nest. Each unknown neighbour
+        -- adds a step of cost, so known-safe cells win when they exist.
+        local unknown = 0
+        for _, d in ipairs(DIRS) do
+          local ux, uy = cx + d[1], cy + d[2]
+          if inBounds(game.map, ux, uy) and not isKnown(ux, uy) then
+            unknown = unknown + 1
+          end
+        end
+        local score = cd - nearest * 2 + unknown * 4
         if bestScore == nil or score < bestScore then
           best, bestScore = { x = cx, y = cy }, score
         end
@@ -978,6 +1104,37 @@ local function findFleeCell(game, player)
             seen[nk] = true
             queue[#queue + 1] = { nx, ny, cd + 1 }
           end
+        end
+      end
+    end
+  end
+  return best
+end
+
+-- findFleeCell needs a cell two tiles clear of every threat, which can be
+-- impossible in a short dead end. The fallback picks the passable neighbour
+-- farthest (chebyshev) from any visible hostile, so retreat always exists as
+-- an option and the model can price it against swinging back.
+local function desperateEscapeCell(game, player)
+  local blocked = visibleHostileCells(game, player)
+  local px, py = playerPos(player)
+  local best, bestScore
+  for _, d in ipairs(DIRS) do
+    local nx, ny = px + d[1], py + d[2]
+    if inBounds(game.map, nx, ny) then
+      local nk = ckey(nx, ny)
+      local cell = cellAt(game.map, nx, ny)
+      if not blocked[nk]
+        and not (CC.WEB and cellTypeName(cell) == "web")
+        and isPassableForPath(cell) then
+        local nearest = 999
+        for key in pairs(blocked) do
+          local tx, ty = key % 10000, math.floor(key / 10000)
+          local dd = math.max(math.abs(tx - nx), math.abs(ty - ny))
+          if dd < nearest then nearest = dd end
+        end
+        if bestScore == nil or nearest > bestScore then
+          best, bestScore = { x = nx, y = ny }, nearest
         end
       end
     end
@@ -1254,9 +1411,13 @@ end
 -- which hands the pack several free bites.
 local function doFlee(game, player, cell, why)
   cell = cell or findFleeCell(game, player)
-  if not cell then return false end
-  local steps = travelSteps(game, player, cell.x, cell.y, true, true)
-  if not (steps and steps[1]) then return false end
+  local steps = cell and travelSteps(game, player, cell.x, cell.y, true, true)
+  if not (steps and steps[1]) then
+    cell = desperateEscapeCell(game, player)
+    if not cell then return false end
+    steps = { { x = cell.x, y = cell.y } }
+    why = (why and (why .. ", one step")) or "one step"
+  end
   pressDelta(steps[1].x, steps[1].y)
   S.phase = "flee"
   if now() - (S.fleeLogT or 0) > 2 then
@@ -1316,6 +1477,7 @@ local function modelState(game, player)
     poise = math.max(0, player.poise or 0),
     maxPoise = math.max(1, player.maxPoise or 200),
     injuryAge = injuryAge(game),
+    poison = math.max(0, math.min(1, player.poison or 0)),
   }
 end
 
@@ -1325,37 +1487,21 @@ local function buildPack(near)
     pack[i] = {
       hp = w.hp,
       maxHP = math.max(w.hp, w.maxHP or w.hp),
-      hit = w.hit,
-      maxHit = math.max(w.hit, w.maxHit or w.hit),
+      hit = w.modelHit or w.hit,
+      maxHit = math.max(w.modelHit or w.hit, w.modelMaxHit or w.maxHit),
       attackTime = w.attackTime,
       speed = w.speed,
       dist = w.dist,
       ourHit = w.ourHit,
       aware = w.aware,
-      summoner = w.summoner,
+      summoner = w.summoner and w.summonReady,
       summonCooldown = w.summonCooldown,
-      poisonDps = w.poisonDps,
-      poisonDuration = w.poisonDuration,
+      poisonPerHit = w.poisonPerHit,
       ref = w,
       id = i,
     }
   end
   return pack
-end
-
-local function copyPack(pack)
-  local out = {}
-  for i, t in ipairs(pack) do
-    out[i] = {
-      hp = t.hp, maxHP = t.maxHP, hit = t.hit, maxHit = t.maxHit,
-      attackTime = t.attackTime, speed = t.speed, dist = t.dist,
-      ourHit = t.ourHit, aware = t.aware, summoner = t.summoner,
-      summonCooldown = t.summonCooldown,
-      poisonDps = t.poisonDps, poisonDuration = t.poisonDuration,
-      ref = t.ref, id = t.id,
-    }
-  end
-  return out
 end
 
 -- A charge is worth more when no key has been found yet: the remaining
@@ -1374,7 +1520,7 @@ local function poiseWaitTime(game, player)
 end
 
 local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
-                                  nPot, bestPot, wand, charges)
+                                  nPot, bestPot, wand, charges, fleeWanted)
   local actions, pidx = {}, {}
   for i, t in ipairs(pack) do pidx[t.ref] = i end
   local step = playerStep(prof)
@@ -1401,8 +1547,10 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
 
   local lsReady = charges > 0
     and ((gGameTurn or 0) - (S.lastLSTurn or -1000)) >= CC.LS_CD
-  if lsReady then
-    local Gp = math.min(math.floor(maxhp * CC.LS_FRAC), missing)
+  -- A heal with nothing to heal still costs a full use turn, so it must never
+  -- appear as an option (it was picked five times at full health in test24).
+  local Gp = math.min(math.floor(maxhp * CC.LS_FRAC), missing)
+  if lsReady and Gp > 0 then
     actions[#actions + 1] = {
       kind = "heal", item = "lifestone", healAmount = Gp,
       enemyHeals = adjacentHealMap(pack, player, Gp), time = CC.C_LS,
@@ -1411,11 +1559,19 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
   end
 
   if #adj > 0 then
-    local cell, fsteps = S.modelFleeCell, S.modelFleeSteps
-    if S.modelFleeTurn ~= (gGameTurn or 0) then
-      cell = findFleeCell(game, player)
-      fsteps = cell and travelSteps(game, player, cell.x, cell.y, true, true) or nil
-      S.modelFleeCell, S.modelFleeSteps, S.modelFleeTurn = cell, fsteps, gGameTurn or 0
+    -- A single adjacent wolf that we can afford to kill must be killed, not
+    -- kited forever: fleeing at full health dragged a whole train of enemies
+    -- through the wasp nest in test25. Flee is offered only when the pack
+    -- verdict says the fight is unaffordable, we are nearly dead, or the
+    -- mission is already complete and disengaging is the goal.
+    local cell, fsteps
+    if fleeWanted then
+      cell, fsteps = S.modelFleeCell, S.modelFleeSteps
+      if S.modelFleeTurn ~= (gGameTurn or 0) then
+        cell = findFleeCell(game, player)
+        fsteps = cell and travelSteps(game, player, cell.x, cell.y, true, true) or nil
+        S.modelFleeCell, S.modelFleeSteps, S.modelFleeTurn = cell, fsteps, gGameTurn or 0
+      end
     end
     if cell and fsteps and fsteps[1] then
       local outrunnable = true
@@ -1427,6 +1583,16 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
         time = step, terminal = outrunnable,
         label = "flee", resourceCost = 0.01,
       }
+    else
+      -- Cornered: every reachable cell is next to a threat, but standing to
+      -- trade blows must still compete against the safest single step.
+      local escape = desperateEscapeCell(game, player)
+      if escape then
+        actions[#actions + 1] = {
+          kind = "flee", cell = escape, moveSteps = 1, terminal = false,
+          label = "retreat", resourceCost = 0.02,
+        }
+      end
     end
   else
     local wait = poiseWaitTime(game, player)
@@ -1440,7 +1606,7 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
       local ch = findRetreatCell(game, player)
       if ch then
         actions[#actions + 1] = {
-          kind = "choke", cell = ch, time = step,
+          kind = "choke", cell = ch, time = step, moveSteps = 1,
           label = "choke-" .. tostring(ch.open) .. "/" .. tostring(ch.approach),
           resourceCost = 0.02,
         }
@@ -1453,6 +1619,14 @@ end
 local function betterEval(a, b)
   local au, bu = a.pDeathUpper or 0, b.pDeathUpper or 0
   if math.abs(au - bu) > 0.02 then return au < bu end
+  local ad, bd = a.pDeath or 0, b.pDeath or 0
+  if math.abs(ad - bd) > 1e-9 then return ad < bd end
+  -- All options die in every trial: survival time is the only axis left, and a
+  -- retreat that delays death still beats standing to trade blows.
+  if ad >= 1 - 1e-9 then
+    local at, bt = a.meanDuration or 0, b.meanDuration or 0
+    if math.abs(at - bt) > 1 then return at > bt end
+  end
   local ah, bh = a.meanHP or 0, b.meanHP or 0
   if math.abs(ah - bh) > 1 then return ah > bh end
   local ac, bc = a.action.resourceCost or 0, b.action.resourceCost or 0
@@ -1479,23 +1653,57 @@ local function chooseEval(evals, hasKey, emergency)
   return best, "minimise risk"
 end
 
+-- Summoned units are not in the threat list yet, but they are part of the
+-- fight's cost. A wasp nest spends its energy once and calls 2-4 hornets (or
+-- one queen), which act six ut after appearing.
+local function summonOptions(prof, near)
+  local hasSummoner = false
+  for _, w in ipairs(near) do
+    if w.summoner and w.summonReady then hasSummoner = true end
+  end
+  if not hasSummoner then return nil end
+  local armour = (prof.physFrac or 1) * (1 - math.min(0.9, prof.dodge or 0))
+  local hitChance = 1 - math.min(0.9, prof.dodge or 0)
+  local resist = 1 - (prof.poisonResist or 0)
+  local function sting(dmg, might, time, hp, speed, poison)
+    local raw = dmg * (1 + math.min(1, (might or 0) / 35))
+    return {
+      -- mean of the two-roll variance (0.5) with a 10% crit at x2
+      hit = raw * 0.75 * 1.1 * armour,
+      maxHit = raw * 2 * armour,
+      attackTime = time,
+      speed = speed,
+      hp = hp,
+      poisonPerHit = (poison or 0) * hitChance * resist,
+      ourHit = prof.hit * 0.8,
+    }
+  end
+  return {
+    normal = sting(100, 3, 24, 55, 1.8, 0.15), -- hornets / small_sting
+    queen = sting(60, 5, 12, 200, 1.2, 0.15),  -- queen_hornet / normal_sting
+    countMin = 2, countMax = 4, queenChance = 1 / 6,
+    lag = 6, first = 12,
+  }
+end
+
 local function modelChoose(game, player, prof, adj, near, deadEnd, nPot, bestPot,
-                           wand, charges, emergency)
+                           wand, charges, emergency, fleeWanted)
   if not Model then return nil end
   local pack = buildPack(near)
   if #pack == 0 then return nil end
   local actions = buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
-    nPot, bestPot, wand, charges)
+    nPot, bestPot, wand, charges, fleeWanted)
   if #actions == 0 then return nil end
   local state = modelState(game, player)
   local opts = {
     N = CFG.modelN,
     horizon = CFG.horizon,
     seed = (gGameTurn or 0) + 1,
+    summon = summonOptions(prof, near),
   }
   local evals = {}
   for _, a in ipairs(actions) do
-    local ok, ev = pcall(Model.evaluate, a, state, copyPack(pack), prof, opts)
+    local ok, ev = pcall(Model.evaluate, a, state, pack, prof, opts)
     if ok and ev then
       ev.action = a
       evals[#evals + 1] = ev
@@ -1622,9 +1830,18 @@ local function combatStep(game, player)
   local nPot, bestPot = potionInfo(player)
   local wand = findLifestone(player)
   local charges = lsUses(wand)
-  if Model and CFG.model and (S.modelErrors or 0) < 5 then
+  local reserve = S.hasKey and 0 or CC.LS_RESERVE
+  local v = verdict(near, player.health + poise, nPot,
+    math.max(0, charges - reserve), prof, deadEnd)
+  local fleeWanted = S.hasKey or v == "avoid"
+    or player.health <= math.floor(player.maxHealth * 0.3)
+  -- The model's action set prices contact decisions (hit, heal, flee, wait,
+  -- choke); approach and avoidance at range belong to the movement layer
+  -- below. Running it with nothing adjacent once made a distant wolf's
+  -- approach into an excuse to burn Lifestone charges at full health.
+  if Model and CFG.model and (S.modelErrors or 0) < 5 and #adj > 0 then
     local chosen, evals, reason = modelChoose(game, player, prof, adj, near,
-      deadEnd, nPot, bestPot, wand, charges, emergency)
+      deadEnd, nPot, bestPot, wand, charges, emergency, fleeWanted)
     if chosen then
       logChoice(chosen, evals, reason)
       if executeChoice(game, player, prof, chosen, near) then return true end
@@ -1663,11 +1880,8 @@ local function combatStep(game, player)
     end
   end
 
-  -- 4. Go/no-go for the pack, counting potions and clean heal windows.
-  local reserve = S.hasKey and 0 or CC.LS_RESERVE
-  local v = verdict(near, player.health + poise, nPot,
-    math.max(0, charges - reserve), prof, deadEnd)
-
+  -- 4. Go/no-go for the pack (v and reserve were computed before the model so
+  -- the flee option only appears when the fight is actually unaffordable).
   local function poisonFast()
     for _, t in ipairs(near) do
       if (t.fast and t.poison) or t.actorType == "albino_beetle" then
@@ -1805,7 +2019,9 @@ local function dungeonExitXY(game)
   local name = game.currentWorldName
   local x, y = game.triggerData:findTriggerXYOnLevelWithAction(name, "fnUp")
   if x then return x, y end
-  return game.triggerData:findTriggerXYOnLevelWithActionAndData(name, "playerStart", "Yarrow")
+  local wd = game:getWorldDataWithName(name)
+  local entrance = wd and wd.entrance or "Yarrow"
+  return game.triggerData:findTriggerXYOnLevelWithActionAndData(name, "playerStart", entrance)
 end
 
 local function keyChestXY(game)
@@ -1814,6 +2030,81 @@ local function keyChestXY(game)
   if not list or #list == 0 then return nil end
   local t = list[1]
   return t.x, t.y
+end
+
+-- ---------------------------------------------------------------------------
+-- Campaign progression (guide order). Each town owns the dungeon in its
+-- leadsTo field; clearing that dungeon returns us to the town, and the next
+-- entry in this order becomes the travel target on the overworld.
+local TOWN_ORDER = {
+  "Yarrow", "Moon-upon-Thoss", "Barrow-Linn", "Harrowdus",
+  "Hearthaven", "Wintersholl", "The_Red_Grove",
+}
+
+local function townIndex(name)
+  for i, n in ipairs(TOWN_ORDER) do
+    if n == name then return i end
+  end
+  return nil
+end
+
+-- Nearest walkable cell past the town's zoom bounds. Moving into that zone
+-- makes the game call zoomOut() by itself (hasWalkedOffMapEdge), which drops
+-- us back onto the overworld at the town's entrance.
+local function fleeZoneCell(game, player)
+  local map = game.map
+  local sx, sy = playerPos(player)
+  local queue = { { sx, sy, 0 } }
+  local seen = { [ckey(sx, sy)] = true }
+  local head = 1
+  while head <= #queue do
+    local cx, cy, cd = queue[head][1], queue[head][2], queue[head][3]
+    head = head + 1
+    if cd > 0 and game:isXYInFleeZone(cx, cy) then
+      return { x = cx, y = cy }
+    end
+    if cd < 80 then
+      for _, d in ipairs(DIRS) do
+        local nx, ny = cx + d[1], cy + d[2]
+        if inBounds(map, nx, ny) and not seen[ckey(nx, ny)]
+          and cellWalkable(cellAt(map, nx, ny)) then
+          seen[ckey(nx, ny)] = true
+          queue[#queue + 1] = { nx, ny, cd + 1 }
+        end
+      end
+    end
+  end
+end
+
+-- Walk toward a named town's entrance trigger on the overworld. Stepping onto
+-- the trigger cell makes the game zoom into the town on its own.
+local function overworldTravelStep(game, player, target)
+  local ok, wx, wy = pcall(game.getPositionOfNamedLocationInOverworld, game, target)
+  if not ok or not wx or not wy then
+    if now() - (S.travelLogT or 0) > 5 then
+      S.travelLogT = now()
+      log("travel: no overworld coords for %s", tostring(target))
+    end
+    return false
+  end
+  local px, py = playerPos(player)
+  if px == wx and py == wy then
+    pressKey("return")
+    S.phase = "enter:" .. target
+    return true
+  end
+  local dx, dy = outsideStep(game, player, wx, wy)
+  if dx then
+    pressDelta(dx, dy)
+    S.phase = "travel:" .. target
+    return true
+  end
+  if now() - (S.travelLogT or 0) > 5 then
+    S.travelLogT = now()
+    log("travel: no route to %s at %d,%d from %d,%d",
+      target, wx, wy, px, py)
+  end
+  return false
 end
 
 local function approachCell(game, player, tx, ty)
@@ -1842,8 +2133,41 @@ local function approachCell(game, player, tx, ty)
   return false
 end
 
+-- Locked doors carry their requirement in a locked_door trigger: string data
+-- is the item name, a positive number is a pressure-plate code, and 0 means a
+-- magically sealed door that only the master key opens. A doorLocked with no
+-- trigger needs a lockpick; doorLocked2 is unpickable.
+local function doorTriggerAt(game, x, y, action)
+  local wx, wy = game.map:convertMapXYToWorldXY(x, y)
+  return game.triggerData:getFirstTriggerOnLevelWithActionNameAtXYZeroIndexed(
+    game.currentWorldName, wx, wy, action)
+end
+
+local LOCKED_DOOR_NAMES = { doorLocked = true, gateLocked = true, doorLocked2 = true }
+
+local function lockedDoorPlan(game, player, x, y)
+  local name = cellTypeName(cellAt(game.map, x, y))
+  if not LOCKED_DOOR_NAMES[name] then return nil end
+  if player:findInventoryObjectWithName("key_master") then return nil end
+  local t = doorTriggerAt(game, x, y, "locked_door")
+  if not t then
+    if name == "doorLocked2" then return "sealed" end
+    return "pick"
+  end
+  local data = t.data
+  if data == 0 then return "sealed" end
+  if type(data) == "number" then return "plate:" .. tostring(data) end
+  if type(data) == "string" and data ~= "" then
+    if player:findInventoryObjectWithName(data) then return nil end
+    return "key:" .. data
+  end
+  return "pick"
+end
+
 -- Nearest known door plus the nav steps to a cell next to it. Empty steps mean
--- the player is already adjacent and can bump it immediately.
+-- the player is already adjacent and can bump it immediately. Doors that
+-- cannot currently be opened are skipped so the bot does not bounce off them
+-- forever; doorObjectiveStep goes after their key or plate instead.
 local function findRoutableDoor(game, player)
   local map = game.map
   local sx, sy = playerPos(player)
@@ -1860,17 +2184,21 @@ local function findRoutableDoor(game, player)
       local nx, ny = cx + d[1], cy + d[2]
       if inBounds(map, nx, ny) and isKnown(nx, ny) then
         local neighbour = cellAt(map, nx, ny)
-        if isBumpableDoorName(cellTypeName(neighbour)) then
-          checked = checked + 1
-          if checked > 24 then return nil end
-          if cx == sx and cy == sy then
-            return nx, ny, {}
+        local nname = cellTypeName(neighbour)
+        if isBumpableDoorName(nname) then
+          local plan = lockedDoorPlan(game, player, nx, ny)
+          if plan == nil or plan == "pick" then
+            checked = checked + 1
+            if checked > 24 then return nil end
+            if cx == sx and cy == sy then
+              return nx, ny, {}, plan
+            end
+            local steps = navSteps(game, player, cx, cy)
+            if steps and steps[1] then
+              return nx, ny, steps, plan
+            end
           end
-          local steps = navSteps(game, player, cx, cy)
-          if steps and steps[1] then
-            return nx, ny, steps
-          end
-        elseif cellWalkable(neighbour) and not seen[ckey(nx, ny)] then
+        elseif isPassableForPath(neighbour) and not seen[ckey(nx, ny)] then
           seen[ckey(nx, ny)] = true
           queue[#queue + 1] = { nx, ny }
         end
@@ -1880,11 +2208,44 @@ local function findRoutableDoor(game, player)
   return nil
 end
 
+-- Secret doors look like walls until bumped. The game raises
+-- game.gotFeelingAboutSecretDoor when the player stands next to one, so when
+-- exploration stalls we sweep the neighbouring walls (a few per second).
+local DANGEROUS_BUMP = {
+  lava = true, staticFire = true, fire = true, void = true,
+  sea = true, deepSea = true, water = true, deepWater = true,
+}
+
+local function trySecretDoorSweep(game, player)
+  if not game.gotFeelingAboutSecretDoor then return false end
+  local px, py = playerPos(player)
+  for _, d in ipairs(DIRS) do
+    local nx, ny = px + d[1], py + d[2]
+    if inBounds(game.map, nx, ny) then
+      local cell = cellAt(game.map, nx, ny)
+      local name = cellTypeName(cell)
+      if name and not cellWalkable(cell) and not isBumpableObstacleName(name)
+        and not DANGEROUS_BUMP[name] then
+        local k = ckey(nx, ny)
+        local t = now()
+        if t - (S.sweptAt[k] or -100) > 3 then
+          S.sweptAt[k] = t
+          log("secret-door sweep: bumping %s at %d,%d", name, nx, ny)
+          pressDelta(d[1], d[2])
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
 local function tryOpenDoor(game, player)
-  local dx, dy, steps = findRoutableDoor(game, player)
+  local dx, dy, steps, plan = findRoutableDoor(game, player)
   if not dx then return false end
   local px, py = playerPos(player)
   if #steps == 0 then
+    if plan == "pick" then return tryPickLock(game, player, dx, dy) end
     pressDelta(dx - px, dy - py)
   else
     pressDelta(steps[1].x, steps[1].y)
@@ -1980,6 +2341,55 @@ local function keyContainerXY(game, name)
       if t.data == name and t.x and t.y then return t.x, t.y end
     end
   end
+end
+
+-- Locked doors that bumping cannot open. Numeric data waits for a floor plate
+-- with the same code; string data waits for an item carried by a creature or
+-- hidden in a container. Route to whichever is missing.
+local function doorObjectiveStep(game, player)
+  local doors = game.triggerData:getAllTriggersOnLevelWithActionName(
+    game.currentWorldName, "locked_door") or {}
+  local codes, items = {}, {}
+  for _, d in ipairs(doors) do
+    local data = d.data
+    if type(data) == "number" and data > 0 then
+      codes[data] = true
+    elseif type(data) == "string" and data ~= ""
+      and not player:findInventoryObjectWithName(data) then
+      items[data] = true
+    end
+  end
+
+  for code in pairs(codes) do
+    local px, py = game.triggerData:findTriggerXYOnLevelWithActionAndData(
+      game.currentWorldName, "fnUnlockWithPlate", code)
+    if px then
+      local mx, my = game.map:convertWorldXYToMapXYZeroIndexed(px, py)
+      if navigateOrOpenDoor(game, player, mx, my) ~= "nopath" then
+        log("door objective: step on plate %s at %d,%d", tostring(code), mx, my)
+        return true
+      end
+    end
+  end
+
+  for item in pairs(items) do
+    local moved, carrier = approachKeyCarrier(game, player, item)
+    if moved then
+      log("door objective: key %s carried by %s", item,
+        tostring(carrier and carrier.actorType))
+      return true
+    end
+    local kx, ky = keyContainerXY(game, item)
+    if kx then
+      local mx, my = game.map:convertWorldXYToMapXYZeroIndexed(kx, ky)
+      if cellWalkable(cellAt(game.map, mx, my)) then
+        if moveToward(game, player, mx, my) ~= "nopath" then return true end
+      elseif approachOrOpenDoor(game, player, mx, my) then
+        return true
+      end
+    end
+  end
+  return false
 end
 
 local function findActionTrigger(game, action, data)
@@ -2098,6 +2508,40 @@ local function dumpMap(game, tag)
   f:close()
 end
 
+local function campaignComplete(reason)
+  S.success = true
+  S.successAt = now()
+  S.finished = true
+  S.done = true
+  log("CAMPAIGN COMPLETE: %s", reason)
+  if not CFG.quit then
+    S.active = false
+  end
+end
+
+-- The master key is consumed by the door out of a run dungeon, so returning
+-- to the entrance town without it is the completion signal. Mark the dungeon
+-- done, reset the per-run flags and point the campaign at the next town.
+local function markDungeonComplete(game, dungeonName)
+  if not dungeonName then return end
+  S.dungeonDone[dungeonName] = true
+  S.entered = false
+  S.hasKey = false
+  S.masterKeyLogged = false
+  S.modelFleeTurn = nil
+  local wd = game:getWorldDataWithName(dungeonName)
+  local entrance = wd and wd.entrance
+  log("DUNGEON COMPLETE: %s (entrance %s)", tostring(dungeonName), tostring(entrance))
+  local idx = entrance and townIndex(entrance) or S.townIndex
+  S.townIndex = math.max(S.townIndex or 1, (idx or 1) + 1)
+  if S.townIndex > #TOWN_ORDER then
+    campaignComplete("every town visited")
+  else
+    S.nextTown = TOWN_ORDER[S.townIndex]
+    log("CAMPAIGN: next target %s", S.nextTown)
+  end
+end
+
 local function tickWorld(game, player)
   local name = game.currentWorldName
   local data = game.currentWorldData
@@ -2107,6 +2551,7 @@ local function tickWorld(game, player)
     S.known = {}
     S.knownCount = 0
     S.knownPX, S.knownPY = nil, nil
+    S.zoomExit = nil
     log("world changed: %s", tostring(name))
     dumpMap(game, "enter")
   end
@@ -2136,68 +2581,175 @@ local function tickWorld(game, player)
 
   if not player:isFreeToMove() then return end
 
-  -- Town: Yarrow's opening errand is a small key chain. Get the chest key from
-  -- the floor, open the locked chest to get the farm gate key, unlock the gate
-  -- around the cave stairs, then enter the dungeon.
-  if data and data.isTown then
+  -- Region view ("Zoom"): walk out of the map edge to return to the overworld.
+  if name == "Zoom" then
+    if combatStep(game, player) then return end
+    if tryHeal(game, player) then return end
     local px, py = playerPos(player)
-    local chestKey = hasItem(player, "farm_chest_key")
-    local gateKey = hasItem(player, "farm_gate_key")
-    local keyObject = findActionTrigger(game, "object", "farm_chest_key")
-    local chest = findActionTrigger(game, "locked_chest", "farm_chest_key")
-    local gate = findActionTrigger(game, "locked_door", "farm_gate_key")
-    local gateKeyContainer = findActionTrigger(game, "container", "farm_gate_key")
-
-    if townSupplyStep(game, player) then
-      S.phase = "town-supplies"
-      return
-    end
-
-    if not chestKey and not gateKey and keyObject then
-      S.phase = "town-key"
-      navigateOrOpenDoor(game, player, keyObject.x, keyObject.y)
-      return
-    end
-
-    if chestKey and chest then
-      S.phase = "town-chest"
-      approachOrOpenDoor(game, player, chest.x, chest.y)
-      return
-    end
-
-    if not gateKey and not chestKey and not chest and gateKeyContainer then
-      S.phase = "town-chest-loot"
-      approachOrOpenDoor(game, player, gateKeyContainer.x, gateKeyContainer.y)
-      return
-    end
-
-    if gateKey and gate then
-      S.phase = "town-gate"
-      approachOrOpenDoor(game, player, gate.x, gate.y)
-      return
-    end
-
-    local sx, sy = game.triggerData:findTriggerXYOnLevelWithActionAndData(
-      name, "playerStart", "firstDungeon-01")
-    S.phase = "to-dungeon"
-    if not sx then
+    local cell = S.zoomExit or fleeZoneCell(game, player)
+    S.zoomExit = cell
+    S.phase = "leave-zoom"
+    if not cell then
       if now() - (S.nopathT or 0) > 5 then
         S.nopathT = now()
-        log("no firstDungeon-01 playerStart in %s", tostring(name))
+        log("no zoom edge from %d,%d", px, py)
       end
       return
     end
-    if px == sx and py == sy then
+    if px == cell.x and py == cell.y then return end
+    if navigateOrOpenDoor(game, player, cell.x, cell.y) ~= "moving" then
+      if now() - (S.nopathT or 0) > 5 then
+        S.nopathT = now()
+        log("zoom edge stuck at %d,%d (edge %d,%d)", px, py, cell.x, cell.y)
+      end
+    end
+    return
+  end
+
+  -- Town: every town owns the dungeon named in its leadsTo field. Yarrow's
+  -- opening dungeon adds a small key chain before the stairs. Towns without a
+  -- dungeon (or whose dungeon is done) are transit stops on the route: walk to
+  -- the Overworld exit trigger and continue on the next world.
+  if data and data.isTown then
+    local px, py = playerPos(player)
+    if S.nextTown == name then
+      S.nextTown = nil
+      log("CAMPAIGN: arrived in %s", name)
+    end
+
+    local target = data.leadsTo
+    local delve = target and not S.dungeonDone[target]
+
+    if delve and target == "firstDungeon-01" then
+      local chestKey = hasItem(player, "farm_chest_key")
+      local gateKey = hasItem(player, "farm_gate_key")
+      local keyObject = findActionTrigger(game, "object", "farm_chest_key")
+      local chest = findActionTrigger(game, "locked_chest", "farm_chest_key")
+      local gate = findActionTrigger(game, "locked_door", "farm_gate_key")
+      local gateKeyContainer = findActionTrigger(game, "container", "farm_gate_key")
+
+      if not chestKey and not gateKey and keyObject then
+        S.phase = "town-key"
+        navigateOrOpenDoor(game, player, keyObject.x, keyObject.y)
+        return
+      end
+
+      if chestKey and chest then
+        S.phase = "town-chest"
+        approachOrOpenDoor(game, player, chest.x, chest.y)
+        return
+      end
+
+      if not gateKey and not chestKey and not chest and gateKeyContainer then
+        S.phase = "town-chest-loot"
+        approachOrOpenDoor(game, player, gateKeyContainer.x, gateKeyContainer.y)
+        return
+      end
+
+      if gateKey and gate then
+        S.phase = "town-gate"
+        approachOrOpenDoor(game, player, gate.x, gate.y)
+        return
+      end
+    end
+
+    if delve then
+      if townSupplyStep(game, player) then
+        S.phase = "town-supplies"
+        return
+      end
+      local sx, sy = game.triggerData:findTriggerXYOnLevelWithActionAndData(
+        name, "playerStart", target)
+      S.phase = "to-dungeon"
+      if not sx then
+        if now() - (S.nopathT or 0) > 5 then
+          S.nopathT = now()
+          log("no %s playerStart in %s", tostring(target), tostring(name))
+        end
+        return
+      end
+      if px == sx and py == sy then
+        pressKey("return")
+        return
+      end
+      if navigateOrOpenDoor(game, player, sx, sy) ~= "moving" then
+        if now() - (S.nopathT or 0) > 5 then
+          S.nopathT = now()
+          log("town stuck at %d,%d heading to %s", px, py, tostring(target))
+        end
+      elseif os.getenv("ZZBOT_DEBUG_MOVE") == "1"
+        and now() - (S.moveLogT or 0) > 1 then
+        S.moveLogT = now()
+        local route = travelSteps(game, player, sx, sy, true)
+          or travelSteps(game, player, sx, sy, false)
+        local names = {}
+        if route then
+          for k = 1, math.min(#route, 3) do
+            local nx, ny = px + route[k].x, py + route[k].y
+            names[#names + 1] = string.format("%d,%d:%s",
+              route[k].x, route[k].y, tostring(cellTypeName(cellAt(game.map, nx, ny))))
+          end
+        end
+        log("move dbg at %d,%d -> %d,%d route=[%s]", px, py, sx, sy,
+          table.concat(names, " "))
+      end
+      return
+    end
+
+    -- Nothing left to delve here: advance the route and step onto the town exit.
+    local idx = townIndex(name) or S.townIndex
+    if (S.townIndex or 1) <= idx then
+      S.townIndex = idx + 1
+      if S.townIndex > #TOWN_ORDER then
+        campaignComplete("visited every town")
+        return
+      end
+      S.nextTown = TOWN_ORDER[S.townIndex]
+      log("CAMPAIGN: leaving %s, next target %s", name, S.nextTown)
+    end
+    S.phase = "leave-town"
+    local ex, ey = game.triggerData:findTriggerXYOnLevelWithActionAndData(
+      name, "playerStart", "Overworld")
+    if not ex then
+      local cell = fleeZoneCell(game, player)
+      ex, ey = cell and cell.x, cell and cell.y
+    end
+    if not ex then
+      if now() - (S.nopathT or 0) > 5 then
+        S.nopathT = now()
+        log("no way out of %s at %d,%d", tostring(name), px, py)
+      end
+      return
+    end
+    if px == ex and py == ey then
+      -- Standing on the exit trigger: interact with it to zoom out.
       pressKey("return")
       return
     end
-    if navigateOrOpenDoor(game, player, sx, sy) ~= "moving" then
+    if navigateOrOpenDoor(game, player, ex, ey) ~= "moving" then
       if now() - (S.nopathT or 0) > 5 then
         S.nopathT = now()
-        log("town stuck at %d,%d (chestKey=%s gateKey=%s chest=%s gate=%s)",
-          px, py, tostring(chestKey), tostring(gateKey),
-          tostring(chest ~= nil), tostring(gate ~= nil))
+        log("town exit stuck at %d,%d (exit %d,%d)", px, py, ex, ey)
       end
+    end
+    return
+  end
+
+  -- Overworld: travel toward the next town's entrance trigger. Stepping onto
+  -- it makes the game zoom into the town by itself.
+  if data and data.isOverworld then
+    if not S.nextTown then
+      S.nextTown = TOWN_ORDER[S.townIndex or 1]
+      log("CAMPAIGN: resuming route at %s", tostring(S.nextTown))
+    end
+    if combatStep(game, player) then return end
+    if tryHeal(game, player) then return end
+    if S.nextTown and overworldTravelStep(game, player, S.nextTown) then return end
+    S.phase = "overworld"
+    if now() - (S.travelLogT or 0) > 5 then
+      S.travelLogT = now()
+      log("overworld idle at %d,%d nextTown=%s",
+        player.position.x, player.position.y, tostring(S.nextTown))
     end
     return
   end
@@ -2224,6 +2776,14 @@ local function tickWorld(game, player)
   if hasMasterKey then
     S.phase = "to-exit"
     if nearestVisibleEnemy(game, player, 3) and combatStep(game, player) then
+      return
+    end
+    -- The key opens the way out but does not finish the run: sweep the rest
+    -- of the level first so loot and unexplored rooms are not left behind.
+    local fx, fy, steps = findFrontier(game, player)
+    if fx and steps and steps[1] then
+      S.phase = "exit-explore"
+      pressDelta(steps[1].x, steps[1].y)
       return
     end
     local ex, ey = dungeonExitXY(game)
@@ -2287,9 +2847,15 @@ local function tickWorld(game, player)
   end
 
   local fx, fy, steps = findFrontier(game, player)
-  if fx then
+  if fx and steps and steps[1] then
     S.phase = "explore"
     pressDelta(steps[1].x, steps[1].y)
+    S.stuckSince = nil
+    return
+  end
+
+  if trySecretDoorSweep(game, player) then
+    S.phase = "secret-door"
     S.stuckSince = nil
     return
   end
@@ -2300,7 +2866,19 @@ local function tickWorld(game, player)
     return
   end
 
+  if doorObjectiveStep(game, player) then
+    S.phase = "objective"
+    S.stuckSince = nil
+    return
+  end
+
   S.phase = "stuck"
+  if not S.stuckShot and love.graphics and love.graphics.captureScreenshot then
+    S.stuckShot = true
+    pcall(love.graphics.captureScreenshot, "zzshot-stuck.png")
+    log("stuck screenshot saved as zzshot-stuck.png (%s at %d,%d)",
+      tostring(game.currentWorldName), px, py)
+  end
   local t = now()
   S.stuckSince = S.stuckSince or t
   if t - (S.stuckLoggedAt or 0) > 10 then
@@ -2359,8 +2937,13 @@ local function checkGlobal()
   if current == G_stateTitleScreen and not S.started then
     if CFG.autostart and G_stateTitleScreen.time and G_stateTitleScreen.time > 1 then
       S.started = true
-      log("starting fresh game as %s", CFG.name)
-      G_stateTitleScreen:startFreshGame(CFG.name)
+      if G_stateTitleScreen.saveGameExists then
+        log("continuing existing save")
+        G_stateTitleScreen:openStartOptions()
+      else
+        log("starting fresh game as %s", CFG.name)
+        G_stateTitleScreen:startFreshGame(CFG.name)
+      end
     end
     return
   end
@@ -2369,6 +2952,18 @@ local function checkGlobal()
   if not game or not game.actorManager or not game.actorManager.player then return end
   local player = game.actorManager.player
   ensureTextHook(game)
+
+  if CFG.shotEvery and CFG.shotEvery > 0
+    and love.graphics and love.graphics.captureScreenshot then
+    if t - (S.lastShotT or 0) >= CFG.shotEvery then
+      S.lastShotT = t
+      S.shotN = (S.shotN or 0) + 1
+      local name = string.format("zzshot-%03d.png", S.shotN)
+      pcall(love.graphics.captureScreenshot, name)
+      log("screenshot %s (%s at %d,%d)", name,
+        tostring(game.currentWorldName), player.position.x, player.position.y)
+    end
+  end
 
   if S.success then
     if CFG.quit and t - (S.successAt or t) > 2 then
@@ -2398,21 +2993,15 @@ local function checkGlobal()
     return
   end
 
-  if S.entered and game.currentWorldData and game.currentWorldData.isTown
-    and player:findInventoryObjectWithName("key_master") == nil then
-    S.success = true
-    S.successAt = t
-    S.finished = true
-    S.done = true
-    dumpMap(game, "success")
+  -- Back in a town while a dungeon is still flagged as entered: that run is
+  -- over. Mark it done and let the campaign route decide what is next.
+  if S.entered and S.dungeonName and game.currentWorldData
+    and game.currentWorldData.isTown then
+    dumpMap(game, "dungeon-done")
     log("SUCCESS: back in %s at %d,%d after %ds (turn %s)",
       tostring(game.currentWorldName), player.position.x, player.position.y,
       math.floor(S.activeTime), tostring(gGameTurn))
-    if CFG.quit then
-      -- give the achievement UI a moment before closing the game
-    else
-      S.active = false
-    end
+    markDungeonComplete(game, S.dungeonName)
     return
   end
 
@@ -2487,6 +3076,7 @@ local function pollToggle()
       S.done = false
       S.entered = false
       S.masterKeyLogged = false
+      S.stuckShot = nil
       log("bot ENABLED (toggle=%s speed=%d)", CFG.toggleKey, SPEED)
     else
       log("bot DISABLED")
