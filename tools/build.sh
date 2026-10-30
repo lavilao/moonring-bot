@@ -4,16 +4,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APPIMAGE="${1:-${MOONRING_APPIMAGE:-/mnt/chromeos/MyFiles/Downloads/moon/Moonring.AppImage}}"
+APPIMAGE="${1:-${MOONRING_APPIMAGE:-}}"
 APP_DIR="$ROOT/work/appimage"
 GAME_DIR="$ROOT/work/moonring-bot"
 
-if [ ! -f "$APPIMAGE" ]; then
-  echo "Moonring AppImage not found: $APPIMAGE" >&2
-  exit 1
-fi
-
 if [ ! -x "$APP_DIR/squashfs-root/bin/Moonring" ]; then
+  if [ -z "$APPIMAGE" ]; then
+    echo "Usage: tools/build.sh /path/to/Moonring.AppImage (or set MOONRING_APPIMAGE)" >&2
+    exit 1
+  fi
+  if [ ! -f "$APPIMAGE" ]; then
+    echo "Moonring AppImage not found: $APPIMAGE" >&2
+    exit 1
+  fi
   echo "Extracting $APPIMAGE ..."
   mkdir -p "$APP_DIR"
   ( cd "$APP_DIR" && "$APPIMAGE" --appimage-extract >/dev/null )

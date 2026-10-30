@@ -26,6 +26,7 @@ local CFG = {
   startTown = tonumber(os.getenv("ZZBOT_START_TOWN")),
   shotEvery = tonumber(os.getenv("ZZBOT_SHOT_INTERVAL")),
   god       = os.getenv("ZZBOT_GOD") or "deathsHarlequin",
+  tour      = (os.getenv("ZZBOT_TOUR") ~= "0"),
 }
 
 local S = {
@@ -234,6 +235,36 @@ local function outsideStep(game, player, wx, wy)
   end
   local nx, ny = k % 10000, math.floor(k / 10000)
   return nx - sx, ny - sy
+end
+
+-- Stepping onto an actor is an attack, and killing an overworld_enemy marker
+-- spawns the whole Zoom battle group behind it. Travel must never walk into
+-- one; go around when there is room.
+local function actorAtWorldXY(game, player, x, y)
+  for _, a in ipairs(game.actorManager.actorArray) do
+    if a.ID ~= player.ID and not a.isCorpse and a.isAway ~= true
+      and a.position.x == x and a.position.y == y then
+      return a
+    end
+  end
+end
+
+local function walkAroundStep(game, player, wx, wy)
+  local map = game.map
+  local sx, sy = toMapXY(game, player.position.x, player.position.y)
+  local best, bestD
+  for _, dir in ipairs(DIRS) do
+    local mx, my = sx + dir[1], sy + dir[2]
+    if map:isPositionInMapXYZeroIndexed(mx, my)
+      and isPassableForPath(cellAt(map, mx, my)) then
+      local nwx, nwy = toWorldXY(game, mx, my)
+      if not actorAtWorldXY(game, player, nwx, nwy) then
+        local d = math.abs(nwx - wx) + math.abs(nwy - wy)
+        if not bestD or d < bestD then best, bestD = dir, d end
+      end
+    end
+  end
+  if best then return best[1], best[2] end
 end
 
 -- Breadth-first path over the real map. Doors count as passable so the bot can
@@ -2049,6 +2080,48 @@ local function townIndex(name)
   return nil
 end
 
+-- Each god pays +2 devotion the first time the player enters its home town.
+-- That is the only steady source of devotion before Relic Dungeons, and the
+-- stat Gifts it buys are the difference against the Keep's constructs. The
+-- tour visits every god town once, filtered against the achievements stored in
+-- the save, so a restart never repeats a paid visit.
+local TOUR_TOWNS = {
+  { town = "Barrow-Linn",   ach = "homeTown3" },  -- lordsOfDust
+  { town = "Harrowdus",     ach = "homeTown2" },  -- deathsHarlequin
+  { town = "Hearthaven",    ach = "homeTown5" },  -- blindAngels
+  { town = "Wintersholl",   ach = "homeTown1" },  -- greatForestWolf
+  { town = "The_Red_Grove", ach = "homeTown4" },  -- ladyOfTheSanguineMoon
+}
+
+local function tourPending(game)
+  if not CFG.tour then return nil end
+  if S.tourPending == nil then
+    S.tourPending = {}
+    for _, t in ipairs(TOUR_TOWNS) do
+      local done = false
+      pcall(function()
+        local ach = game:getAchievements()
+        done = ach and ach.done and ach.done[t.ach] == true
+      end)
+      if not done then S.tourPending[#S.tourPending + 1] = t.town end
+    end
+    log("tour: god towns pending [%s]", table.concat(S.tourPending, ", "))
+  end
+  return #S.tourPending > 0 and S.tourPending or nil
+end
+
+local function tourRemove(name)
+  if not S.tourPending then return false end
+  for i, n in ipairs(S.tourPending) do
+    if n == name then
+      table.remove(S.tourPending, i)
+      log("tour: %s visited (+2 devotion), %d god towns left", name, #S.tourPending)
+      return true
+    end
+  end
+  return false
+end
+
 -- Nearest walkable cell past the town's zoom bounds. Moving into that zone
 -- makes the game call zoomOut() by itself (hasWalkedOffMapEdge), which drops
 -- us back onto the overworld at the town's entrance.
@@ -2079,6 +2152,202 @@ end
 
 -- Walk toward a named town's entrance trigger on the overworld. Stepping onto
 -- the trigger cell makes the game zoom into the town on its own.
+local overRoute = { grid = nil, w = 0, h = 0, entries = nil,
+  failTarget = nil, failWorld = nil }
+
+-- The game keeps only a 96x96 window of the 512x512 overworld in memory, so a
+-- window-local BFS dead-ends behind terrain it cannot see around. The whole map
+-- is in data/save/Overworld.png (tile index packed in R+G, same encoding as
+-- tools.convertRGToTileIndex); decode it once and path over the full world,
+-- stepping one cell at a time so every move stays inside the loaded window.
+local function overworldEntrySet(game)
+  if overRoute.entries then return overRoute.entries end
+  local set = {}
+  local ok, list = pcall(function() return game.triggerData.overworldEntryPoints end)
+  if ok and type(list) == "table" then
+    for _, t in ipairs(list) do
+      if t.x and t.y then set[ckey(t.x, t.y)] = true end
+    end
+  end
+  overRoute.entries = set
+  return set
+end
+
+local function overworldWalkGrid()
+  if overRoute.grid then return overRoute.grid end
+  local ok, img = pcall(love.image.newImageData, "data/save/Overworld.png")
+  if not ok or not img then
+    log("travel: cannot read Overworld.png (%s)", tostring(img))
+    return nil
+  end
+  local CellData = require("cell_data")
+  local w, h = img:getDimensions()
+  local bytes = img:getString()
+  local grid = {}
+  local b = 1
+  local walked = 0
+  for y = 0, h - 1 do
+    local row = {}
+    grid[y] = row
+    for x = 0, w - 1 do
+      local r, g = string.byte(bytes, b, b + 1)
+      local data = CellData.getCellDataWithIndex(r + g * 256)
+      row[x] = data ~= nil and data.isWalkable == true
+      if row[x] then walked = walked + 1 end
+      b = b + 4
+    end
+  end
+  overRoute.grid, overRoute.w, overRoute.h = grid, w, h
+  log("travel: decoded overworld walk grid %dx%d (%d walkable)", w, h, walked)
+  return grid
+end
+
+local function overworldPath(game, sx, sy, tx, ty)
+  local grid = overworldWalkGrid()
+  if not grid then return nil end
+  local w, h = overRoute.w, overRoute.h
+  if tx < 0 or ty < 0 or tx >= w or ty >= h then return nil end
+  local entries = overworldEntrySet(game)
+  local startK = sy * 4096 + sx
+  local targetK = ty * 4096 + tx
+  local parent = { [startK] = false }
+  local queue = { startK }
+  local head = 1
+  local found = startK == targetK
+  while head <= #queue and not found do
+    local k = queue[head]
+    head = head + 1
+    local cx, cy = k % 4096, math.floor(k / 4096)
+    for _, d in ipairs(DIRS) do
+      local nx, ny = cx + d[1], cy + d[2]
+      if nx >= 0 and ny >= 0 and nx < w and ny < h then
+        local nk = ny * 4096 + nx
+        if parent[nk] == nil then
+          local isTarget = nx == tx and ny == ty
+          local entry = entries[ckey(nx, ny)]
+          if grid[ny][nx] and (isTarget or not entry) then
+            parent[nk] = k
+            if isTarget then found = true; break end
+            queue[#queue + 1] = nk
+          end
+        end
+      end
+    end
+  end
+  if not found then
+    overRoute.failTarget, overRoute.failWorld = S.nextTown, game.currentWorldName
+    if now() - (S.pathFailLogT or 0) > 5 then
+      S.pathFailLogT = now()
+      log("travel: no global route from %d,%d to %d,%d", sx, sy, tx, ty)
+    end
+    return nil
+  end
+  local path = {}
+  local k = targetK
+  while k and k ~= startK do
+    path[#path + 1] = { x = k % 4096, y = math.floor(k / 4096) }
+    k = parent[k]
+  end
+  for i = 1, math.floor(#path / 2) do
+    path[i], path[#path - i + 1] = path[#path - i + 1], path[i]
+  end
+  return path
+end
+
+-- Derive the next cell from the player's actual position instead of consuming
+-- an index. The game drops injected keys while other actors spend time, so the
+-- same step gets requested for several ticks in a row and must stay valid.
+local function pathStepFrom(path, px, py)
+  for i = 1, #path do
+    if path[i].x == px and path[i].y == py then
+      return path[i + 1]
+    end
+  end
+  local first = path[1]
+  if first and math.abs(first.x - px) + math.abs(first.y - py) == 1 then
+    return first
+  end
+end
+
+-- First step of the cached global route, recomputed whenever the player is not
+-- standing where the route expects or the target changed.
+local function globalOverworldStep(game, player, wx, wy)
+  -- Retrying a BFS that already proved the target unreachable just burns
+  -- frames; the ferry leg handles the crossing from here.
+  if overRoute.failTarget == S.nextTown and overRoute.failWorld == game.currentWorldName then
+    return nil
+  end
+  local px, py = playerPos(player)
+  local path = overRoute.path
+  if not (path and overRoute.target == S.nextTown and overRoute.endX == wx
+    and overRoute.endY == wy) then
+    path = overworldPath(game, px, py, wx, wy)
+    if not path or #path == 0 then
+      overRoute.path = nil
+      return nil
+    end
+    overRoute.path = path
+    overRoute.target, overRoute.endX, overRoute.endY = S.nextTown, wx, wy
+    log("travel: global route to %s is %d steps", tostring(S.nextTown), #path)
+  end
+  local step = pathStepFrom(path, px, py)
+  if not step then
+    overRoute.path = nil
+    return nil
+  end
+  return step.x - px, step.y - py
+end
+
+-- The overworld is an archipelago and the only sea link joins Moon-upon-Thoss
+-- (the mainland gate) with the little dock town beside Barrow-Linn. When no
+-- land route exists, walk to the gate for the outbound crossing or to the dock
+-- for the free return, and press Return there to enter the town that sails.
+local FERRY_DOCK = { x = 192, y = 292 }
+local FERRY_GATE = { x = 248, y = 244 }
+local ferryRoute = { target = nil, world = nil, goal = nil, path = nil,
+  failed = false }
+
+local function ferryLegStep(game, player, target)
+  local px, py = playerPos(player)
+  if ferryRoute.target ~= target or ferryRoute.world ~= game.currentWorldName then
+    ferryRoute.target, ferryRoute.world = target, game.currentWorldName
+    ferryRoute.goal, ferryRoute.path = nil, nil
+    ferryRoute.failed = false
+  end
+  if ferryRoute.failed then return nil end
+  if not (ferryRoute.goal and ferryRoute.path) then
+    ferryRoute.goal, ferryRoute.path = nil, nil
+    local dock = overworldPath(game, px, py, FERRY_DOCK.x, FERRY_DOCK.y)
+    if dock then
+      ferryRoute.goal, ferryRoute.path = FERRY_DOCK, dock
+      log("travel: ferry leg to the Barrow-Linn dock (%d steps)", #dock)
+    elseif target == "Barrow-Linn" then
+      local gate = overworldPath(game, px, py, FERRY_GATE.x, FERRY_GATE.y)
+      if gate then
+        ferryRoute.goal, ferryRoute.path = FERRY_GATE, gate
+        log("travel: ferry leg to the Moon-upon-Thoss gate (%d steps)", #gate)
+      end
+    end
+    if not ferryRoute.path then
+      ferryRoute.failed = true
+      log("travel: no ferry leg from %d,%d for %s", px, py, tostring(target))
+      return nil
+    end
+  end
+  if px == ferryRoute.goal.x and py == ferryRoute.goal.y then
+    pressKey("return")
+    S.phase = "ferry-board"
+    return true
+  end
+  local step = pathStepFrom(ferryRoute.path, px, py)
+  if not step then
+    -- Combat nudged us off the route: rebuild from here next tick.
+    ferryRoute.path = nil
+    return nil
+  end
+  return step.x - px, step.y - py
+end
+
 local function overworldTravelStep(game, player, target)
   local ok, wx, wy = pcall(game.getPositionOfNamedLocationInOverworld, game, target)
   if not ok or not wx or not wy then
@@ -2094,8 +2363,34 @@ local function overworldTravelStep(game, player, target)
     S.phase = "enter:" .. target
     return true
   end
-  local dx, dy = outsideStep(game, player, wx, wy)
+  local dx, dy
+  local landRouteGone = overRoute.failTarget == S.nextTown
+    and overRoute.failWorld == game.currentWorldName
+  if not landRouteGone then
+    dx, dy = globalOverworldStep(game, player, wx, wy)
+    if not dx and overRoute.failTarget ~= S.nextTown then
+      dx, dy = outsideStep(game, player, wx, wy)
+    end
+  end
+  if not dx then
+    dx, dy = ferryLegStep(game, player, target)
+  end
   if dx then
+    local bx, by = px + dx, py + dy
+    local blocker = actorAtWorldXY(game, player, bx, by)
+    if blocker then
+      dx, dy = walkAroundStep(game, player, wx, wy)
+      if not dx then
+        pressKey("space")
+        S.phase = "travel-blocked"
+        if now() - (S.blockLogT or 0) > 5 then
+          S.blockLogT = now()
+          log("travel: %s blocks %d,%d from %d,%d",
+            tostring(blocker.actorType), bx, by, px, py)
+        end
+        return true
+      end
+    end
     pressDelta(dx, dy)
     S.phase = "travel:" .. target
     return true
@@ -2475,8 +2770,11 @@ local function godStep(game, player)
 
   if buyGiftStep(game, player) then return true end
 
+  -- Dedication curses every other god, which would lock their Gifts. Spend
+  -- the tour's devotion everywhere first, and only then pick a patron.
   if CFG.god and G_Globals.godData[CFG.god] and not game:getCurrentGod()
-    and not game:isCursedByGod(CFG.god) then
+    and not game:isCursedByGod(CFG.god)
+    and not (S.tourPending and #S.tourPending > 0) then
     if now() - (S.dedicateTriedAt or -100) > 10 then
       S.dedicateTriedAt = now()
       log("god: dedicating to %s", CFG.god)
@@ -2542,6 +2840,52 @@ local function innRestStep(game, player)
   else
     pressDelta(best[1].x, best[1].y)
   end
+  return true
+end
+
+-- Ferry: attemptToPayFerryman opens the one-option "Sail" box that
+-- handleDialogs confirms, then the game runs the whole crossing (zoom out,
+-- teleport, fade). Moon-upon-Thoss is the gate to the Barrow-Linn isle; the
+-- dock town beside Barrow-Linn sails back for free.
+local function ferryFare(game)
+  local price = 150
+  pcall(function()
+    price = game.economy:getNonObjectActualPrice(G_Globals.ferryCost)
+  end)
+  local money = 0
+  pcall(function() money = game:getPlayerStats().money or 0 end)
+  return price, money
+end
+
+local function ferryStep(game, player)
+  if game.isOnFerry or game.isSleeping then return false end
+  if not player:isFreeToMove() then return false end
+  if game.confirmBox and game.confirmBox.isOpen then return false end
+  if game.multiChoiceBox and game.multiChoiceBox.isOpen then return false end
+  if game.speechArea and game.speechArea.isOpen then return false end
+  local name = game.currentWorldName
+  if name == "Moon-upon-Thoss" then
+    if S.nextTown ~= "Barrow-Linn" then return false end
+    local price, money = ferryFare(game)
+    if money < price then
+      if now() - (S.ferryPoorT or 0) > 10 then
+        S.ferryPoorT = now()
+        log("ferry: fare %d unaffordable (money %d)", price, money)
+      end
+      return false
+    end
+  elseif name ~= "Barrow-Linn-Ferry" then
+    return false
+  end
+  if now() - (S.ferryTriedAt or -100) < 3 then return false end
+  S.ferryTriedAt = now()
+  local ok, err = pcall(game.attemptToPayFerryman, game)
+  if not ok then
+    log("ferry: attempt failed: %s", tostring(err))
+    return false
+  end
+  log("ferry: boarding at %s for %s", name,
+    name == "Moon-upon-Thoss" and "Barrow-Linn" or "Moon-upon-Thoss")
   return true
 end
 
@@ -2659,7 +3003,8 @@ local function markDungeonComplete(game, dungeonName)
   if S.townIndex > #TOWN_ORDER then
     campaignComplete("every town visited")
   else
-    S.nextTown = TOWN_ORDER[S.townIndex]
+    local pending = tourPending(game)
+    S.nextTown = (pending and pending[1]) or TOWN_ORDER[S.townIndex]
     log("CAMPAIGN: next target %s", S.nextTown)
   end
 end
@@ -2674,8 +3019,25 @@ local function tickWorld(game, player)
     S.knownCount = 0
     S.knownPX, S.knownPY = nil, nil
     S.zoomExit = nil
+    overRoute.path, overRoute.failTarget, overRoute.failWorld = nil, nil, nil
+    ferryRoute.goal, ferryRoute.path, ferryRoute.failed = nil, nil, false
     log("world changed: %s", tostring(name))
     dumpMap(game, "enter")
+  end
+
+  -- The game owns the player for the whole ferry cutscene; just wait it out.
+  if game.isOnFerry then
+    S.wasOnFerry = true
+    S.phase = "ferry"
+    return
+  elseif S.wasOnFerry then
+    S.wasOnFerry = false
+    overRoute.path, overRoute.failTarget, overRoute.failWorld = nil, nil, nil
+    ferryRoute.target, ferryRoute.goal, ferryRoute.path, ferryRoute.failed =
+      nil, nil, nil, false
+    S.ferryTriedAt = nil
+    log("ferry: landed in %s at %d,%d", tostring(name),
+      player.position.x, player.position.y)
   end
 
   if data and data.dungeonType and not S.entered then
@@ -2734,16 +3096,59 @@ local function tickWorld(game, player)
   -- the Overworld exit trigger and continue on the next world.
   if data and data.isTown then
     local px, py = playerPos(player)
+    local tourActive = tourPending(game) ~= nil
     if S.nextTown == name then
       S.nextTown = nil
       log("CAMPAIGN: arrived in %s", name)
+      if tourRemove(name) then tourActive = true end
     end
 
     -- Boons first: offerings, Gifts and dedication only happen in safe towns.
     if godStep(game, player) then return end
 
+    -- The ferry is the only way on or off the Barrow-Linn isle. Sail from the
+    -- Moon-upon-Thoss gate when the route points at Barrow-Linn, and from the
+    -- dock town when the route points anywhere else.
+    local wantSail = (name == "Moon-upon-Thoss" and S.nextTown == "Barrow-Linn")
+      or (name == "Barrow-Linn-Ferry" and S.nextTown ~= "Barrow-Linn")
+    if wantSail then
+      if innRestStep(game, player) then
+        S.phase = "ferry-inn"
+        return
+      end
+      if ferryStep(game, player) then
+        S.phase = "ferry"
+        return
+      end
+    end
+
+    -- Without the fare the bot bounces through the town gate forever: the
+    -- overworld leg walks back onto the entrance, Return re-enters town, and
+    -- the transit branch leaves again. Stay here until money is available
+    -- (selling loot is still pending); Gifts and the inn run above.
+    if name == "Moon-upon-Thoss" and S.nextTown == "Barrow-Linn" then
+      local price, money = ferryFare(game)
+      if money < price then
+        S.phase = "ferry-poor"
+        if now() - (S.ferryPoorT or 0) > 10 then
+          S.ferryPoorT = now()
+          log("ferry: waiting in town, fare %d but money is %d", price, money)
+        end
+        return
+      end
+    end
+
+    -- Tour stops are transit-only: visit the god's home for the Devotional
+    -- Task, rest if hurt, and move on without touching the dungeon here.
+    if tourActive then
+      if innRestStep(game, player) then
+        S.phase = "tour-inn"
+        return
+      end
+    end
+
     local target = data.leadsTo
-    local delve = target and not S.dungeonDone[target]
+    local delve = target and not S.dungeonDone[target] and not tourActive
 
     if delve and target == "firstDungeon-01" then
       local chestKey = hasItem(player, "farm_chest_key")
@@ -2826,17 +3231,23 @@ local function tickWorld(game, player)
     end
 
     -- Nothing left to delve here: advance the route and step onto the town exit.
-    local idx = townIndex(name) or S.townIndex
-    if (S.townIndex or 1) <= idx then
-      S.townIndex = idx + 1
-      if S.townIndex > #TOWN_ORDER then
-        campaignComplete("visited every town")
-        return
+    if tourActive then
+      S.phase = "tour-town"
+    else
+      -- The ferry dock is not a campaign town; passing through it must not
+      -- advance the route past the next real town.
+      local idx = townIndex(name)
+      if idx and (S.townIndex or 1) <= idx then
+        S.townIndex = idx + 1
+        if S.townIndex > #TOWN_ORDER then
+          campaignComplete("visited every town")
+          return
+        end
+        S.nextTown = TOWN_ORDER[S.townIndex]
+        log("CAMPAIGN: leaving %s, next target %s", name, S.nextTown)
       end
-      S.nextTown = TOWN_ORDER[S.townIndex]
-      log("CAMPAIGN: leaving %s, next target %s", name, S.nextTown)
+      S.phase = "leave-town"
     end
-    S.phase = "leave-town"
     local ex, ey = game.triggerData:findTriggerXYOnLevelWithActionAndData(
       name, "playerStart", "Overworld")
     if not ex then
@@ -2868,10 +3279,13 @@ local function tickWorld(game, player)
   -- it makes the game zoom into the town by itself.
   if data and data.isOverworld then
     if not S.nextTown then
-      S.nextTown = TOWN_ORDER[S.townIndex or 1]
+      local pending = tourPending(game)
+      S.nextTown = (pending and pending[1]) or TOWN_ORDER[S.townIndex or 1]
       log("CAMPAIGN: resuming route at %s", tostring(S.nextTown))
     end
-    if combatStep(game, player) then return end
+    -- Overworld "enemies" are only markers: contact turns into a Zoom battle
+    -- with a whole monster group, so stopping to fight or choke on one is how
+    -- the bot got caught. Keep walking the route and let pursuers trail.
     if tryHeal(game, player) then return end
     if S.nextTown and overworldTravelStep(game, player, S.nextTown) then return end
     S.phase = "overworld"
@@ -3171,11 +3585,14 @@ local function checkGlobal()
       tostring(stone and stone.durability or 0), S.phase, S.knownCount)
     pcall(function()
       local ps = game:getPlayerStats()
-      log("stats money=%s str=%s fin=%s int=%s per=%s end=%s dev(%s)=%s following=%s",
+      local devs = {}
+      for _, g in ipairs(G_Globals.skillFactions) do
+        devs[#devs + 1] = string.format("%s=%s", g, tostring(game:getDevotion(g)))
+      end
+      log("stats money=%s str=%s fin=%s int=%s per=%s end=%s dev=[%s] following=%s",
         tostring(ps.money), tostring(ps.strength), tostring(ps.finesse),
         tostring(ps.intellect), tostring(ps.perception), tostring(ps.endurance),
-        tostring(CFG.god), tostring(game:getDevotion(CFG.god)),
-        tostring(game:getCurrentGod()))
+        table.concat(devs, " "), tostring(game:getCurrentGod()))
     end)
     dumpMap(game, "beat")
   end

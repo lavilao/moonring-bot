@@ -33,6 +33,16 @@ local function prof(over)
   return p
 end
 
+local function summon(over)
+  local s = {
+    lag = 6, countMin = 2, countMax = 2, queenChance = 0, first = 12,
+    normal = { hit = 20, maxHit = 40, attackTime = 10, speed = 2,
+               hp = 10, poisonPerHit = 0 },
+  }
+  for k, v in pairs(over or {}) do s[k] = v end
+  return s
+end
+
 run("poise fully absorbs oversized bite", function()
   local state = { hp = 100, maxHP = 100, poise = 50, maxPoise = 200, injuryAge = 36 }
   local pack = { enemy({ hit = 300, maxHit = 300, attackTime = 10000 }) }
@@ -45,7 +55,7 @@ end)
 run("same seed is deterministic", function()
   local state = { hp = 80, maxHP = 120, poise = 90, maxPoise = 200, injuryAge = 10 }
   local pack = {
-    enemy({ hit = 14, maxHit = 30, attackTime = 20, speed = 1.2, dist = 1, poisonDps = 0.3 }),
+    enemy({ hit = 14, maxHit = 30, attackTime = 20, speed = 1.2, dist = 1, poisonPerHit = 0.15 }),
     enemy({ hit = 9, maxHit = 22, attackTime = 30, speed = 1, dist = 2 }),
   }
   local action = { kind = "attack", target = 1 }
@@ -92,33 +102,54 @@ run("flee escapes slow enemies but not fast ones", function()
   check(fastFlee.meanDamage > 0, "fast flee took no damage")
 end)
 
-run("killing the summoner stops summons", function()
-  local state = { hp = 500, maxHP = 500, poise = 0, maxPoise = 200, injuryAge = 0 }
-  local pack = {
-    enemy({ hp = 10, maxHP = 10, hit = 0, maxHit = 1, dist = 2,
-      summoner = true, summonCooldown = 100 }),
-    enemy({ hp = 100000, maxHP = 100000, hit = 1, maxHit = 1, dist = 2 }),
-  }
-  local opts = { N = 4, seed = 11, horizon = 350, summonHit = 0 }
-  local kill = M.evaluate({ kind = "attack", target = 1 }, state, pack, prof({ hit = 10 }), opts)
-  local leave = M.evaluate({ kind = "attack", target = 2 }, state, pack, prof({ hit = 10 }), opts)
-  check(kill.meanSummons < leave.meanSummons,
-    ("%s >= %s"):format(tostring(kill.meanSummons), tostring(leave.meanSummons)))
-  check(leave.meanSummons > 0, "summoner never summoned")
+run("poison burst halves current hp and bypasses poise", function()
+  local state = { hp = 100, maxHP = 100, poise = 200, maxPoise = 200, injuryAge = 36 }
+  local pack = { enemy({ hit = 0, maxHit = 1, attackTime = 10000,
+    poisonPerHit = 1.0, hp = 1000, maxHP = 1000 }) }
+  local ev = M.evaluate({ kind = "wait" }, state, pack, prof(), { N = 1, seed = 13, horizon = 1 })
+  check(ev.meanHP == 50, "hp after poison: " .. tostring(ev.meanHP))
+  check(ev.meanPoise == 200, "poise was consumed by poison")
+  check(ev.pDeath == 0, "poison killed the player")
+  check(ev.meanPoisonBursts == 1, "no burst recorded")
 end)
 
-run("poison bypasses poise and adds damage", function()
-  local state = { hp = 10, maxHP = 100, poise = 200, maxPoise = 200, injuryAge = 36 }
-  local base = { hit = 1, maxHit = 1, attackTime = 10000, hp = 1000, maxHP = 1000 }
-  local poisoned = enemy({ hit = 1, maxHit = 1, attackTime = 10000, hp = 1000, maxHP = 1000,
-    poisonDps = 2, poisonDuration = 240 })
-  local plain = enemy(base)
-  local opts = { N = 8, seed = 13, horizon = 30 }
-  local a = M.evaluate({ kind = "wait" }, state, { poisoned }, prof(), opts)
-  local b = M.evaluate({ kind = "wait" }, state, { plain }, prof(), opts)
-  check(a.meanDamage > b.meanDamage, "poison did not add damage")
-  check(a.pDeath > 0, "poison did not kill low-hp player")
-  check(a.meanPoise > 0, "poise was not still full")
+run("poison cannot kill", function()
+  local state = { hp = 1, maxHP = 100, poise = 0, maxPoise = 200, injuryAge = 0 }
+  local pack = { enemy({ hit = 0, maxHit = 1, attackTime = 10000,
+    poisonPerHit = 1.0, hp = 1000, maxHP = 1000 }) }
+  local ev = M.evaluate({ kind = "wait" }, state, pack, prof(), { N = 4, seed = 19, horizon = 1 })
+  check(ev.pDeath == 0, "poison death recorded")
+  check(ev.meanHP == 1, "hp fell below 1: " .. tostring(ev.meanHP))
+end)
+
+run("summoner minions close distance and bite", function()
+  local state = { hp = 500, maxHP = 500, poise = 0, maxPoise = 200, injuryAge = 0 }
+  local pack = { enemy({ hp = 1000, maxHP = 1000, hit = 0, maxHit = 1, dist = 3,
+    summoner = true, summonCooldown = 4000, summonFirst = 12 }) }
+  local opts = { N = 8, seed = 11, horizon = 200, summon = summon() }
+  local ev = M.evaluate({ kind = "wait" }, state, pack, prof(), opts)
+  check(ev.meanSummons > 0, "summoner never summoned: " .. tostring(ev.meanSummons))
+  check(ev.meanDamage > 0, "minions never reached the player")
+end)
+
+run("killing a summoner before its first summon stops it", function()
+  local state = { hp = 500, maxHP = 500, poise = 0, maxPoise = 200, injuryAge = 0 }
+  local pack = { enemy({ hp = 5, maxHP = 5, hit = 0, maxHit = 1, dist = 1,
+    ourHit = 100, summoner = true, summonCooldown = 4000, summonFirst = 12 }) }
+  local opts = { N = 4, seed = 23, horizon = 200, summon = summon() }
+  local kill = M.evaluate({ kind = "attack", target = 1 }, state, pack, prof({ hit = 100 }), opts)
+  local wait = M.evaluate({ kind = "wait" }, state, pack, prof({ hit = 100 }), opts)
+  check(kill.meanSummons == 0, "killed summoner still summoned")
+  check(kill.meanDamage == 0, "killed summoner still dealt damage")
+  check(wait.meanSummons > 0, "waiting did not let the summoner act")
+end)
+
+run("reference policy does not strike distant enemies", function()
+  local state = { hp = 100, maxHP = 100, poise = 0, maxPoise = 200, injuryAge = 0 }
+  local pack = { enemy({ hp = 10, maxHP = 10, hit = 0, maxHit = 1, dist = 5, speed = 0.01 }) }
+  local p = prof({ hit = 10, step = 8 })
+  local ev = M.evaluate({ kind = "wait" }, state, pack, p, { N = 1, seed = 29, horizon = 1 })
+  check(ev.meanKills == 0, "hit an enemy five tiles away")
 end)
 
 run("lethal rolls give nonzero death probability", function()
@@ -126,6 +157,7 @@ run("lethal rolls give nonzero death probability", function()
   local pack = { enemy({ hit = 7, maxHit = 14, hp = 1000, maxHP = 1000 }) }
   local ev = M.evaluate({ kind = "wait" }, state, pack, prof(), { N = 96, seed = 17, horizon = 1 })
   check(ev.pDeath > 0, "no deaths observed")
+  check(ev.pDeath < 1, "every trial died")
   check(ev.pDeathUpper > ev.pDeath,
     ("upper %s <= p %s"):format(tostring(ev.pDeathUpper), tostring(ev.pDeath)))
 end)

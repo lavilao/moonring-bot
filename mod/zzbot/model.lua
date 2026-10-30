@@ -1,22 +1,27 @@
 -- Pure Monte Carlo model of Moonring's combat clock. No Love/game globals.
+-- Damage, poise, poison and summons follow the numbers in actor.lua,
+-- actions.lua and the CSV data tables; see docs/mechanics.md.
 local M = {}
 
 M.C = {
-  BASE_TICK = 1,
   MAX_POISE = 200,
   WAIT_TIME = 12,
   USE_TIME = 12,
-  POISON_DURATION = 240,
   POISE_FRACTION_PER_TICK = 0.0125,
   POISE_REGEN_DELAY = 36,
+  POISON_DECAY_PER_TICK = 0.00125,
+  POISON_DECAY_DELAY = 10,
+  POISON_BURST_FRACTION = 0.5,
   BITE_CV = 0.34,
   Z95 = 1.96,
   DEFAULT_N = 96,
   DEFAULT_HORIZON = 600,
   DEFAULT_ENEMY_ATTACK_TIME = 24,
-  DEFAULT_SUMMON_COOLDOWN = 200,
-  DEFAULT_SUMMON_ATTACK_TIME = 24,
-  DEFAULT_SUMMON_LAG = 24,
+  DEFAULT_SUMMON_LAG = 6,
+  DEFAULT_SUMMON_FIRST = 12,
+  DEFAULT_SUMMON_COOLDOWN = 4000,
+  DEFAULT_SUMMON_COUNT_MIN = 2,
+  DEFAULT_SUMMON_COUNT_MAX = 4,
 }
 
 local MOD = 2147483647
@@ -33,9 +38,9 @@ local function clamp(v, lo, hi)
   return v
 end
 
-local function mixSeed(base, trial, index)
+local function mixSeed(base, trial)
   local s = math.floor(num(base, 1)) % (MOD - 1)
-  s = (s + trial * 7919 + index * 104729 + 12345) % (MOD - 1)
+  s = (s + trial * 7919 + 12345) % (MOD - 1)
   if s <= 0 then s = MOD - 1 end
   return s
 end
@@ -49,25 +54,47 @@ function M.rng(seed)
   end
 end
 
+-- Consecutive LCG outputs lie on a lattice, so summing three of them badly
+-- under-represents the tails. One uniform through the exact Bates(3) inverse
+-- CDF (the distribution of the sum of three uniforms) fixes the per-bite law.
+local BATES_INV
+do
+  local K = 512
+  BATES_INV = {}
+  local function cdf(x)
+    if x <= 0 then return 0 end
+    if x >= 3 then return 1 end
+    local v = x * x * x
+    if x > 1 then v = v - 3 * (x - 1) ^ 3 end
+    if x > 2 then v = v + 3 * (x - 2) ^ 3 end
+    return v / 6
+  end
+  for i = 0, K do
+    local r, lo, hi = i / K, 0, 3
+    for _ = 1, 36 do
+      local mid = (lo + hi) * 0.5
+      if cdf(mid) < r then lo = mid else hi = mid end
+    end
+    BATES_INV[i] = (lo + hi) * 0.5
+  end
+end
+local BATES_K = #BATES_INV - 1
+
+local function bates3(r)
+  if r <= 0 then return 0 end
+  if r >= 1 then return 3 end
+  local f = r * BATES_K
+  local i = math.floor(f)
+  local frac = f - i
+  return BATES_INV[i] + (BATES_INV[i + 1] - BATES_INV[i]) * frac
+end
+
 local function sampleBite(rng, mean, maxHit)
   mean = num(mean, 0)
   if mean <= 0 then return 0 end
   local hi = math.max(1, num(maxHit, mean * 2))
-  local u = rng() + rng() + rng() - 1.5 -- sum of 3 uniforms, sd 0.5
-  local v = mean + 2 * M.C.BITE_CV * mean * u
+  local v = mean * (1 + 2 * M.C.BITE_CV * (bates3(rng()) - 1.5))
   return clamp(v, 1, hi)
-end
-
-local function copyState(state)
-  local maxHP = math.max(1, num(state and state.maxHP, 100))
-  local maxPoise = math.max(1, num(state and state.maxPoise, M.C.MAX_POISE))
-  return {
-    hp = num(state and state.hp, maxHP),
-    maxHP = maxHP,
-    poise = clamp(num(state and state.poise, maxPoise), 0, maxPoise),
-    maxPoise = maxPoise,
-    injuryAge = math.max(0, num(state and state.injuryAge, 0)),
-  }
 end
 
 local function copyPack(pack)
@@ -85,14 +112,14 @@ local function copyPack(pack)
       e.speed = math.max(0.1, num(t.speed, 1))
       e.moveCost = 8 / e.speed
       e.gap = math.max(0, num(t.dist, 1))
+      e.ourHit = type(t.ourHit) == "number" and math.max(0, t.ourHit) or nil
+      e.poisonPerHit = math.max(0, num(t.poisonPerHit, 0))
       e.budget = 0
       e.alive = (t.alive ~= false) and e.hp > 0
       e.summoner = t.summoner and true or false
       e.summonCooldown = math.max(1, num(t.summonCooldown, M.C.DEFAULT_SUMMON_COOLDOWN))
-      e.nextSummon = e.summonCooldown
-      e.poisonDps = math.max(0, num(t.poisonDps, 0))
-      e.poisonDuration = math.max(1, num(t.poisonDuration, M.C.POISON_DURATION))
-      e.rate = e.hit / e.attackTime
+      e.nextSummon = math.max(0, num(t.summonFirst, M.C.DEFAULT_SUMMON_FIRST))
+      e.rate = (e.hit + 16 * e.poisonPerHit) / e.attackTime
       out[i] = e
     end
   end
@@ -108,34 +135,16 @@ local function meanPackHit(pack)
   return n > 0 and sum / n or 0
 end
 
-local function bestTarget(sim)
-  local best, bestRate, bestHit
-  for i = 1, #sim.enemies do
-    local e = sim.enemies[i]
-    if e.alive then
-      local r = e.rate
-      if not best or r > bestRate + EPS
-        or (math.abs(r - bestRate) <= EPS and e.hit > bestHit + EPS) then
-        best, bestRate, bestHit = i, r, e.hit
-      end
-    end
-  end
-  return best
-end
-
-local function anyAlive(sim)
-  for i = 1, #sim.enemies do
-    if sim.enemies[i].alive then return true end
-  end
-  return false
-end
-
 local function anyAdjacent(sim)
   for i = 1, #sim.enemies do
     local e = sim.enemies[i]
     if e.alive and e.gap <= 1 + EPS then return true end
   end
-  return #sim.minions > 0
+  for i = 1, #sim.minions do
+    local m = sim.minions[i]
+    if m.alive and m.gap <= 1 + EPS then return true end
+  end
+  return false
 end
 
 local function killEnemy(sim, e)
@@ -148,12 +157,26 @@ end
 local function damageEnemy(sim, idx, dmg)
   local e = sim.enemies[idx]
   if not e or not e.alive then return end
-  dmg = math.max(0, num(dmg, 0))
-  e.hp = e.hp - dmg
+  e.hp = e.hp - math.max(0, num(dmg, 0))
   if e.hp <= 0 then
     e.hp = 0
     killEnemy(sim, e)
   end
+end
+
+local function damageMinion(sim, m, dmg)
+  if not m or not m.alive then return end
+  m.hp = m.hp - math.max(0, num(dmg, 0))
+  if m.hp <= 0 then
+    m.hp = 0
+    m.alive = false
+    sim.kills = sim.kills + 1
+  end
+end
+
+local function hitOn(sim, e)
+  if type(e.ourHit) == "number" then return e.ourHit end
+  return math.max(0, num(sim.prof.hit, 0))
 end
 
 local function healPlayer(sim, amount)
@@ -181,17 +204,36 @@ local function applyIncoming(sim, dmg)
   end
 end
 
-local function bite(sim, e)
-  applyIncoming(sim, sampleBite(sim.rng, e.hit, e.maxHit))
-  if sim.hp > 0 and e.poisonDps > 0 then
-    sim.poisonDps = e.poisonDps
-    sim.poisonUntil = sim.t + e.poisonDuration
+-- Poison is not a damage-over-time: when the meter reaches 1 it instantly
+-- removes half of current health, bypasses poise, can never kill (clamped to
+-- 1 hp) and resets the meter (actor.lua:4058-4066, actor.lua:8515).
+local function applyPoisonHit(sim, e)
+  local p = num(e and e.poisonPerHit, 0)
+  if p <= 0 or sim.hp <= 0 then return end
+  sim.poison = sim.poison + p
+  sim.lastPoisonT = sim.t
+  if sim.poison >= 1 - EPS then
+    local lost = math.ceil(sim.hp * M.C.POISON_BURST_FRACTION)
+    sim.hp = math.max(1, sim.hp - lost)
+    sim.rawDamage = sim.rawDamage + lost
+    sim.poisonBursts = sim.poisonBursts + 1
+    sim.poison = 0
     sim.injuryAge = 0
   end
 end
 
-local function minionBite(sim, m)
-  applyIncoming(sim, sampleBite(sim.rng, sim.summonHit, sim.summonMaxHit))
+local function bite(sim, e)
+  applyIncoming(sim, sampleBite(sim.rng, e.hit, e.maxHit))
+  if sim.hp > 0 then applyPoisonHit(sim, e) end
+end
+
+local function nearestPackIndex(sim)
+  local best, bestGap
+  for i = 1, #sim.enemies do
+    local e = sim.enemies[i]
+    if e.alive and (not best or e.gap < bestGap) then best, bestGap = i, e.gap end
+  end
+  return best
 end
 
 local function enemyPhase(sim, dt)
@@ -202,7 +244,7 @@ local function enemyPhase(sim, dt)
     if e.alive then
       if sim.choke then
         if not sim.chokeFront or not sim.chokeFront.alive then
-          sim.chokeFront = sim.enemies[bestTarget(sim)]
+          sim.chokeFront = sim.enemies[nearestPackIndex(sim)]
         end
         e.budget = (e == sim.chokeFront) and (e.budget + dt) or 0
       else
@@ -228,26 +270,13 @@ end
 
 local function applyPassive(sim, dt)
   if dt <= EPS then return true end
-  local startT = sim.t
-  local poisoned = sim.poisonDps > 0 and sim.poisonUntil > startT + EPS
-  if poisoned then
-    local pd = math.min(dt, sim.poisonUntil - startT)
-    local dmg = sim.poisonDps * pd
-    local lost = math.min(dmg, sim.hp)
-    sim.rawDamage = sim.rawDamage + lost
-    sim.hp = sim.hp - dmg
-    sim.injuryAge = 0
-    if sim.hp <= 0 then
-      local dieOff = (lost / sim.poisonDps)
-      sim.hp = 0
-      sim.dead = true
-      sim.deathT = startT + dieOff
-      sim.t = sim.deathT
-      return false
+  if sim.poison > 0 then
+    local since = sim.t - sim.lastPoisonT
+    local delay = math.max(0, M.C.POISON_DECAY_DELAY - since)
+    local decayT = math.max(0, dt - delay)
+    if decayT > 0 then
+      sim.poison = math.max(0, sim.poison - M.C.POISON_DECAY_PER_TICK * decayT)
     end
-    sim.poisonUntil = math.max(sim.poisonUntil, startT + pd)
-    sim.injuryAge = 0
-    return true
   end
   if not anyAdjacent(sim) then
     local delay = math.max(0, M.C.POISE_REGEN_DELAY - sim.injuryAge)
@@ -261,28 +290,64 @@ local function applyPassive(sim, dt)
   return true
 end
 
+local function minionSpec(sim, queen)
+  local s = queen and sim.queen or sim.normal
+  return {
+    hp = math.max(1, num(s.hp, 50)),
+    hit = math.max(0, num(s.hit, 0)),
+    maxHit = math.max(1, num(s.maxHit, math.max(1, num(s.hit, 0) * 2))),
+    attackTime = math.max(1, num(s.attackTime, M.C.DEFAULT_ENEMY_ATTACK_TIME)),
+    speed = math.max(0.1, num(s.speed, 1.5)),
+    poisonPerHit = math.max(0, num(s.poisonPerHit, 0)),
+    ourHit = type(s.ourHit) == "number" and s.ourHit or nil,
+  }
+end
+
 local function spawnDue(sim)
   for i = 1, #sim.enemies do
     local e = sim.enemies[i]
     if e.alive and e.summoner then
       while e.nextSummon <= sim.t + EPS do
+        local lo = math.max(1, math.floor(num(sim.summonCountMin, 2)))
+        local hi = math.max(lo, math.floor(num(sim.summonCountMax, 4)))
+        local count = lo + math.floor(sim.rng() * (hi - lo + 1))
+        for _ = 1, count do
+          local queen = sim.rng() < sim.queenChance
+          local spec = minionSpec(sim, queen)
+          sim.minions[#sim.minions + 1] = {
+            hp = spec.hp,
+            maxHP = spec.hp,
+            hit = spec.hit,
+            maxHit = spec.maxHit,
+            attackTime = spec.attackTime,
+            speed = spec.speed,
+            moveCost = 8 / spec.speed,
+            poisonPerHit = spec.poisonPerHit,
+            ourHit = spec.ourHit,
+            gap = math.max(1, e.gap),
+            alive = true,
+            nextAct = sim.t + sim.summonLag,
+          }
+        end
         sim.summons = sim.summons + 1
-        sim.minions[#sim.minions + 1] = {
-          nextBite = e.nextSummon + sim.summonLag,
-          attackTime = sim.summonAttack,
-        }
         e.nextSummon = e.nextSummon + e.summonCooldown
       end
     end
   end
 end
 
-local function minionBitesDue(sim)
+local function minionStep(sim)
   for i = 1, #sim.minions do
     local m = sim.minions[i]
-    while sim.hp > 0 and m.nextBite <= sim.t + EPS do
-      minionBite(sim, m)
-      m.nextBite = m.nextBite + m.attackTime
+    while m.alive and sim.hp > 0 and m.nextAct <= sim.t + EPS do
+      if m.gap > 1 + EPS then
+        m.gap = m.gap - 1
+        m.nextAct = m.nextAct + m.moveCost
+      else
+        applyIncoming(sim, sampleBite(sim.rng, m.hit, m.maxHit))
+        if sim.hp > 0 then applyPoisonHit(sim, m) end
+        m.nextAct = m.nextAct + m.attackTime
+      end
     end
   end
 end
@@ -292,8 +357,10 @@ local function advanceTo(sim, target)
   while sim.hp > 0 and sim.t < target - EPS do
     local nextT = target
     for i = 1, #sim.minions do
-      local n = sim.minions[i].nextBite
-      if n > sim.t + EPS and n < nextT - EPS then nextT = n end
+      local m = sim.minions[i]
+      if m.alive and m.nextAct > sim.t + EPS and m.nextAct < nextT - EPS then
+        nextT = m.nextAct
+      end
     end
     for i = 1, #sim.enemies do
       local e = sim.enemies[i]
@@ -304,11 +371,12 @@ local function advanceTo(sim, target)
     end
     local dt = nextT - sim.t
     if dt > EPS then
-      if not applyPassive(sim, dt) then return end
+      applyPassive(sim, dt)
       sim.t = nextT
     end
+    if sim.hp <= 0 then return end
     spawnDue(sim)
-    minionBitesDue(sim)
+    minionStep(sim)
     if nextT >= target - EPS then break end
   end
 end
@@ -317,6 +385,10 @@ local function stepGap(sim)
   for i = 1, #sim.enemies do
     local e = sim.enemies[i]
     if e.alive then e.gap = e.gap + 1 end
+  end
+  for i = 1, #sim.minions do
+    local m = sim.minions[i]
+    if m.alive then m.gap = m.gap + 1 end
   end
 end
 
@@ -336,35 +408,127 @@ local function runMovement(sim, action, kind)
   local steps = math.max(0, math.floor(num(action.moveSteps, 1)))
   local step = num(sim.prof.step, 8 / math.max(0.1, num(sim.prof.speed, 1)))
   if step <= 0 then step = 8 end
-  for s = 1, steps do
+  for _ = 1, steps do
     if sim.hp <= 0 or sim.t >= sim.horizon - EPS then break end
     local t0 = sim.t
     stepGap(sim)
     enemyPhase(sim, step)
     advanceTo(sim, t0 + step)
-    if kind == "flee" and s >= 1 and allOutrun(sim, step) then break end
+    if kind == "flee" and allOutrun(sim, step) then
+      sim.escaped = true
+      break
+    end
   end
   if action.terminal and (kind == "flee" or kind == "move") then
     sim.escaped = true
   end
 end
 
+-- The player's own attacks only reach adjacent enemies; standing still and
+-- swinging at something five tiles away would make every option look safe.
+local function adjacentEnemyIndex(sim)
+  local best, bestRate
+  for i = 1, #sim.enemies do
+    local e = sim.enemies[i]
+    if e.alive and e.gap <= 1 + EPS
+      and (not sim.choke or e == sim.chokeFront) then
+      if e.summoner then return i end
+      local r = e.rate
+      if not best or r > bestRate + EPS then best, bestRate = i, r end
+    end
+  end
+  return best
+end
+
+local function adjacentMinion(sim)
+  local best, bestRate
+  for i = 1, #sim.minions do
+    local m = sim.minions[i]
+    if m.alive and m.gap <= 1 + EPS then
+      local r = m.hit / m.attackTime
+      if not best or r > bestRate + EPS then best, bestRate = m, r end
+    end
+  end
+  return best
+end
+
+local function nearestThreat(sim)
+  local best, bestGap
+  for i = 1, #sim.enemies do
+    local e = sim.enemies[i]
+    if e.alive and (not best or e.gap < bestGap) then best, bestGap = e, e.gap end
+  end
+  for i = 1, #sim.minions do
+    local m = sim.minions[i]
+    if m.alive and (not best or m.gap < bestGap) then best, bestGap = m, m.gap end
+  end
+  return best
+end
+
+local function referenceRollout(sim)
+  local at = math.max(1, num(sim.prof.attackTime, 15))
+  local step = math.max(1, num(sim.prof.step, 8))
+  while sim.hp > 0 and sim.t < sim.horizon - EPS do
+    local alivePack = false
+    for i = 1, #sim.enemies do
+      if sim.enemies[i].alive then alivePack = true break end
+    end
+    local aliveMinion = false
+    for i = 1, #sim.minions do
+      if sim.minions[i].alive then aliveMinion = true break end
+    end
+    if not alivePack and not aliveMinion then break end
+
+    local idx = adjacentEnemyIndex(sim)
+    local minion = adjacentMinion(sim)
+    local target
+    if idx then
+      damageEnemy(sim, idx, hitOn(sim, sim.enemies[idx]))
+      target = at
+    elseif minion then
+      damageMinion(sim, minion, hitOn(sim, minion))
+      target = at
+    else
+      local t = nearestThreat(sim)
+      if sim.choke then
+        target = at
+      elseif t then
+        -- close one tile toward the nearest threat, then let enemies act
+        t.gap = math.max(0, t.gap - 1)
+        target = step
+      else
+        target = at
+      end
+    end
+    enemyPhase(sim, target)
+    if sim.hp <= 0 then break end
+    advanceTo(sim, sim.t + target)
+  end
+end
+
 local function firstAction(sim, action)
   local kind = action.kind or "wait"
   local prof = sim.prof
-  if kind == "choke" or action.choke then sim.choke = true end
 
-  if kind == "attack" or kind == "choke" then
+  if kind == "attack" then
     local idx = action.target
-    if not (idx and sim.enemies[idx] and sim.enemies[idx].alive) then
-      idx = bestTarget(sim)
+    if not (idx and sim.enemies[idx] and sim.enemies[idx].alive
+            and sim.enemies[idx].gap <= 1 + EPS) then
+      idx = adjacentEnemyIndex(sim)
     end
-    if sim.choke and idx then sim.chokeFront = sim.enemies[idx] end
-    if idx then damageEnemy(sim, idx, prof.hit) end
+    if idx then damageEnemy(sim, idx, hitOn(sim, sim.enemies[idx])) end
     local T = math.max(0, num(action.time, prof.attackTime))
     local t0 = sim.t
     enemyPhase(sim, T)
     if sim.hp > 0 then advanceTo(sim, t0 + T) end
+  elseif kind == "choke" then
+    -- one step toward the choke, then the reference holds the funnel
+    runMovement(sim, { moveSteps = 1 }, "move")
+    if sim.hp > 0 then
+      sim.choke = true
+      local i = nearestPackIndex(sim)
+      sim.chokeFront = i and sim.enemies[i] or nil
+    end
   elseif kind == "heal" then
     healPlayer(sim, action.healAmount or action.amount)
     if type(action.enemyHeals) == "table" then
@@ -389,39 +553,27 @@ local function firstAction(sim, action)
   end
 end
 
-local function referenceRollout(sim)
-  local at = math.max(1, num(sim.prof.attackTime, 15))
-  while sim.hp > 0 and sim.t < sim.horizon - EPS do
-    if not anyAlive(sim) then
-      if #sim.minions > 0 then advanceTo(sim, sim.horizon) end
-      break
-    end
-    local idx = sim.choke and sim.chokeFront and sim.chokeFront.alive
-      and (function()
-        for i = 1, #sim.enemies do
-          if sim.enemies[i] == sim.chokeFront then return i end
-        end
-      end)() or bestTarget(sim)
-    if idx then damageEnemy(sim, idx, sim.prof.hit) end
-    if not anyAlive(sim) and #sim.minions == 0 then break end
-    enemyPhase(sim, at)
-    if sim.hp <= 0 then break end
-    advanceTo(sim, sim.t + at)
-  end
-end
-
-local function simulate(action, state, pack, prof, opts, index)
+local function simulate(action, state, pack, prof, opts, trial)
   local maxHP = math.max(1, num(state and state.maxHP, 100))
   local maxPoise = math.max(1, num(state and state.maxPoise, M.C.MAX_POISE))
   local enemies = copyPack(pack)
-  local summonHit = num(opts and opts.summonHit,
-    meanPackHit(enemies) * 0.5)
+  local summon = opts and opts.summon
+  local normal = (summon and summon.normal) or {
+    hit = meanPackHit(enemies) * 0.5,
+    maxHit = math.max(1, meanPackHit(enemies)),
+    attackTime = M.C.DEFAULT_ENEMY_ATTACK_TIME,
+    speed = 1.5,
+    hp = 50,
+    poisonPerHit = 0,
+  }
   local sim = {
-    hp = num(state and state.hp, maxHP),
+    hp = math.max(0, num(state and state.hp, maxHP)),
     maxHP = maxHP,
     poise = clamp(num(state and state.poise, maxPoise), 0, maxPoise),
     maxPoise = maxPoise,
     injuryAge = math.max(0, num(state and state.injuryAge, 0)),
+    poison = clamp(num(state and state.poison, 0), 0, 1),
+    lastPoisonT = -M.C.POISON_DECAY_DELAY,
     enemies = enemies,
     prof = {
       attackTime = math.max(1, num(prof and prof.attackTime, 15)),
@@ -429,31 +581,33 @@ local function simulate(action, state, pack, prof, opts, index)
       hit = math.max(0, num(prof and prof.hit, 0)),
       speed = math.max(0.1, num(prof and prof.speed, 1)),
     },
-    rng = M.rng(mixSeed(num(opts and opts.seed, 1), 1, index)),
+    rng = M.rng(mixSeed(num(opts and opts.seed, 1), trial)),
     horizon = math.max(0, num(opts and opts.horizon, M.C.DEFAULT_HORIZON)),
     t = 0,
     rawDamage = 0,
     kills = 0,
     summons = 0,
     healsReceived = 0,
-    poisonDps = 0,
-    poisonUntil = 0,
+    poisonBursts = 0,
     minions = {},
-    summonHit = math.max(0, summonHit),
-    summonMaxHit = math.max(1, num(opts and opts.summonMaxHit, math.max(1, summonHit * 2))),
-    summonAttack = math.max(1, num(opts and opts.summonAttackTime, M.C.DEFAULT_SUMMON_ATTACK_TIME)),
-    summonLag = math.max(0, num(opts and opts.summonLag, M.C.DEFAULT_SUMMON_LAG)),
+    normal = normal,
+    queen = (summon and summon.queen) or normal,
+    queenChance = clamp(num(summon and summon.queenChance, 0), 0, 1),
+    summonCountMin = num(summon and summon.countMin, M.C.DEFAULT_SUMMON_COUNT_MIN),
+    summonCountMax = num(summon and summon.countMax, M.C.DEFAULT_SUMMON_COUNT_MAX),
+    summonLag = math.max(0, num(summon and summon.lag, M.C.DEFAULT_SUMMON_LAG)),
     choke = false,
     chokeFront = nil,
     dead = false,
     deathT = nil,
     escaped = false,
   }
-  sim.hp = math.max(0, sim.hp)
-  if sim.hp <= 0 then sim.dead = true; sim.deathT = 0 end
-  if not sim.dead then
+  if sim.hp <= 0 then
+    sim.dead = true
+    sim.deathT = 0
+  else
     firstAction(sim, action or {})
-    if not sim.escaped then referenceRollout(sim) end
+    if not sim.escaped and sim.hp > 0 then referenceRollout(sim) end
   end
   local endT = sim.dead and (sim.deathT or sim.t) or math.min(sim.t, sim.horizon)
   return {
@@ -464,6 +618,7 @@ local function simulate(action, state, pack, prof, opts, index)
     kills = sim.kills,
     summons = sim.summons,
     heals = sim.healsReceived,
+    poisonBursts = sim.poisonBursts,
     death = sim.dead and 1 or 0,
   }
 end
@@ -485,15 +640,14 @@ local function evaluateAt(action, state, pack, prof, opts, index)
   local horizon = math.max(0, num(opts.horizon, M.C.DEFAULT_HORIZON))
   local localOpts = {
     seed = baseSeed, horizon = horizon, N = N,
-    summonHit = opts.summonHit, summonMaxHit = opts.summonMaxHit,
-    summonAttackTime = opts.summonAttackTime, summonLag = opts.summonLag,
+    summon = opts.summon,
   }
   local hps, aliveHps = {}, {}
   local deaths, sumHP, sumAlive, sumPoise, sumDamage = 0, 0, 0, 0, 0
-  local sumDur, sumKills, sumSummons, sumHeals = 0, 0, 0, 0
+  local sumDur, sumKills, sumSummons, sumHeals, sumBursts = 0, 0, 0, 0, 0
   local aliveCount = 0
   for trial = 1, N do
-    local r = simulate(action, state, pack, prof, localOpts, index)
+    local r = simulate(action, state, pack, prof, localOpts, trial)
     hps[trial] = r.hp
     sumHP = sumHP + r.hp
     if r.death == 0 then
@@ -509,6 +663,7 @@ local function evaluateAt(action, state, pack, prof, opts, index)
     sumKills = sumKills + r.kills
     sumSummons = sumSummons + r.summons
     sumHeals = sumHeals + r.heals
+    sumBursts = sumBursts + r.poisonBursts
   end
   table.sort(hps)
   local p10idx = math.max(1, math.ceil(0.10 * N))
@@ -525,6 +680,7 @@ local function evaluateAt(action, state, pack, prof, opts, index)
     meanKills = sumKills / N,
     meanSummons = sumSummons / N,
     meanHealsReceived = sumHeals / N,
+    meanPoisonBursts = sumBursts / N,
     n = N,
     seed = baseSeed,
   }

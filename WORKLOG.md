@@ -599,3 +599,129 @@ enemigos", "sufrir 13 estados alterados"). El bot ya dedica (boon + cura full)
 y compra Gifts cuando tiene devoción; falta farmear devoción.
 Añadido: descanso en cama de posada en pueblo cuando hp < max antes de entrar
 a la mazmorra, y log de money/stats/devoción por beat para medir la debilidad.
+
+## 2026-10-30 — Gira de devoción: logros de ciudad natal y el archipiélago
+
+### Por qué una gira
+
+Cada ciudad natal de un dios concede +2 de devoción al entrar (logro
+`visitAllTowns`; `saveCurrentWorldAndChangeWorld` en `state_game.lua` llama a
+`processAchievement` y después `game:alterDevotion` al detectar `isHomeTown`).
+La devoción se puede gastar en la misma visita porque el aviso solo abre un
+alertBox que `handleDialogs` cierra. Con 5 ciudades natales + el logro cómico
+"visitar todas las ciudades" la gira produce 12 de devoción antes de la
+mazmorra 2, que es exactamente lo que el modelo de combate necesita para que
+los Gifts/dedicación decidan la pelea contra los Nomans.
+
+Diseño A (implementado): mientras queden ciudades de dios pendientes, todas
+las ciudades son solo de tránsito (se saltan sus mazmorras, incluidas Yarrow y
+Moon-upon-Thoss); tras la quinta, la ruta vuelve a `TOWN_ORDER[S.townIndex]`
+(Yarrow, índice aún 1) y se hacen las mazmorras en orden de campaña con la
+devoción ya gastada en Gifts.
+
+- `TOUR_TOWNS = { Barrow-Linn, Harrowdus, Hearthaven, Wintersholl, The_Red_Grove }`
+  (los pueblos natales de homeTown3/2/5/1/4).
+- `tourPending(game)` lee `game:getAchievements().done` y devuelve las que
+  faltan; `tourRemove()` las descuenta de `S.tourPending` al entrar.
+- El `leadsTo` de cada ciudad sigue definiendo su mazmorra para la fase de
+  campaña.
+
+### El mundo exterior es un archipiélago
+
+Decodificado `data/save/Overworld.png` (índice de tile = R + G*256, con
+`cellTypeArray` 1-based → en Python `cells[i-1]`; 537 tipos, 12 110 celdas
+andables) y calculadas componentes conexas 4-dir:
+
+- Componente 23 (7 812 celdas): Yarrow (267,223), Moon-upon-Thoss (248,244),
+  Harrowdus (310,311), Hearthaven (251,149), Wintersholl (339,242) y
+  The_Red_Grove (176,190).
+- Componente 106 (80 celdas): Barrow-Linn (189,287) y su embarcadero
+  Barrow-Linn-Ferry (192,292), con 24 y 1 jetty respectivamente.
+- Conclusión: existe ruta terrestre entre todas las ciudades menos
+  Barrow-Linn, a la que solo se llega en transbordador.
+
+### El transbordador
+
+- `game:attemptToPayFerryman()` abre un multiChoiceBox de una opción ("Sail")
+  con `price = economy:getNonObjectActualPrice(G_Globals.ferryCost)`
+  (`ferryCost = 150` en Globals). `takeFerry()` cobra 150 salvo cuando el
+  destino es Moon-upon-Thoss (viaje de vuelta gratis desde el embarcadero).
+- La travesía la resuelve `updateFerryTime` (envolvente `gFerryEnvelope`,
+  8.1 s): `zoomOut`, teletransporte al trigger `ferryDestination` del
+  Overworld, fundido y checkpoint. Mientras `game.isOnFerry` el juego ignora
+  la entrada del jugador, así que `tick` espera.
+- Destinos: en Moon-upon-Thoss el transbordador va a Barrow-Linn-Ferry; en
+  Barrow-Linn-Ferry vuelve a Moon-upon-Thoss.
+
+Capa nueva en `mod/zzbot/init.lua`:
+
+- `ferryLegStep`: si no hay ruta terrestre al destino, camina hasta el
+  embarcadero (192,292) si es alcanzable, o hasta la puerta de
+  Moon-upon-Thoss (248,244) cuando el destino es Barrow-Linn; al pisar la
+  celda pulsa Return para entrar a la ciudad que tiene el ferry.
+- `ferryStep` (rama de pueblo): en Moon-upon-Thoss solo intenta embarcar si
+  `S.nextTown == "Barrow-Linn"`; en Barrow-Linn-Ferry siempre que el destino
+  no sea Barrow-Linn. Comprueba el precio contra el dinero para no abrir un
+  alertBox en bucle y espera a que la posada cure antes de zarpar.
+- La rama de tránsito no avanza `S.townIndex` al pasar por Barrow-Linn-Ferry
+  (no es ciudad de campaña).
+
+### Test39 — ruta del ferry y muerte en una emboscada
+
+Primer test con la capa del ferry: el bot salió del Zoom inicial, detectó
+"no global route ... to 189,287" y "to 192,292", y encaminó al gate de
+Moon-upon-Thoss (72 pasos). Pero la ruta se reconstruía en cada tick
+("ferry leg ... 72 steps" repetido) porque el índice del path se consumía
+aunque el juego descartara la tecla: `tick` corre dentro de `getPlayerInput`
+y el juego sale antes de leer el movimiento cuando otro actor está gastando
+tiempo (`actorManager:isAnyNonPlayerActorStillSpendingTime`). El bot avanzaba
+a duras penas y además se paró a "hold-choke" contra un `overworld_enemy`,
+que no es un enemigo sino un marcador que al contacto abre un Zoom con un
+grupo entero (lobos + cazador); murió en ese Zoom (bites de 142-172).
+
+Arreglos:
+
+- `pathStepFrom(path, px, py)` deriva el siguiente paso de la posición real
+  (no consume índice); la ruta solo se reconstruye si el jugador se sale de
+  ella. Aplicado a la ruta global y a la del ferry.
+- En el Overworld ya no se llama a `combatStep`: los perseguidores se dejan
+  atrás caminando la ruta; pararse a pelear/chokear es lo que provocaba la
+  emboscada.
+
+### Test40 — la ruta ya no vibra, pero el bot se metía solo en las emboscadas
+
+Con `pathStepFrom` la ruta del ferry se mantuvo estable (3 logs en vez de
+cientos), pero el bot seguía atrapado en el bolsillo de 221,239 (pasillo de
+una celda) y moría en Zooms sucesivos (lobos, belarks). Causa real: un
+`overworld_enemy` es un actor de 100 PV; al pisarlo el jugador lo mata y
+`actions.lua` (muerte del spawner) llama a
+`setReadyForZoomInXYWithMonsterGroupSpawnTypeAndDirectionOfAttackAndStatuses`,
+que abre el Zoom con todo el grupo. El bot caminaba hacia el marcador que
+bloqueaba el pasillo y lo mataba él mismo. Arreglos:
+
+- `actorAtWorldXY` + `walkAroundStep`: en el overworld nunca se pisa una celda
+  ocupada; se rodea si hay hueco y, si no, se espera (`travel-blocked`).
+- Si la ruta terrestre ya falló para este destino (`overRoute.failTarget`), no
+  se usa el paso codicioso `outsideStep` (paseaba hacia la costa de una isla
+  inalcanzable): se va directo a la pata del ferry.
+- Los fallos de BFS se registran como máximo cada 5 s (`S.pathFailLogT`).
+
+### Test41 — base limpia en Yarrow y el billete del ferry
+
+Baseline nuevo: `work/save-backup/save-075659` (personaje en Yarrow 42,41,
+primera mazmorra en curso o recién hecha). El bot salió de Yarrow, cruzó el
+overworld, pisó la puerta de Moon-upon-Thoss (248,244), entró y pidió el
+transbordador. **El pasaje real es 121 guineas (no 150) y el personaje tiene
+100**, así que `takeFerry` no se abrió y el bot rebotó en bucle
+Overworld(248,244) → Moon-upon-Thoss → salida → Overworld, porque la rama de
+tránsito volvía a salir de la ciudad.
+
+Arreglo: `ferryFare()` y guarda `ferry-poor` — con `S.nextTown ==
+"Barrow-Linn"` y sin dinero para el billete, el bot se queda dentro de
+Moon-upon-Thoss (los Gifts y la posada siguen corriendo) en vez de rebotar.
+
+Pendiente inmediato: **economía para costear el billete**. Hay loot de la
+primera mazmorra y tiendas (`CEconomy`), pero vender objetos aún no está
+implementado (tarea #9/#10). Alternativa: cargar un baseline con más dinero
+(el save del usuario en 221,239 lo tiene, pero está en un bolsillo con
+perseguidores).
