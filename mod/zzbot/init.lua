@@ -25,6 +25,7 @@ local CFG = {
   horizon   = tonumber(os.getenv("ZZBOT_HORIZON")) or 480,
   startTown = tonumber(os.getenv("ZZBOT_START_TOWN")),
   shotEvery = tonumber(os.getenv("ZZBOT_SHOT_INTERVAL")),
+  god       = os.getenv("ZZBOT_GOD") or "deathsHarlequin",
 }
 
 local S = {
@@ -2400,6 +2401,92 @@ local function findActionTrigger(game, action, data)
   end
 end
 
+-- Gods: the gods screen is game.skillTree, and every purchase the UI makes is
+-- activateCellForGridFactionAtXY(x, y). We call the same method, but first
+-- check the devotion cost, because it lives in a local table of the installed
+-- skill_tree.lua and must be parsed from the game source.
+local function skillCostMap()
+  if S.skillCosts then return S.skillCosts end
+  local costs = {}
+  local src = love.filesystem and love.filesystem.read
+    and love.filesystem.read("skill_tree.lua")
+  if src then
+    for name, cost in src:gmatch('skillTileData%["([^"]+)"%]%s*=%s*{cost%s*=%s*(%d+)') do
+      costs[name] = tonumber(cost)
+    end
+  end
+  S.skillCosts = costs
+  return costs
+end
+
+local function godIndex(name)
+  for i, v in ipairs(G_Globals.skillFactions) do
+    if v == name then return i end
+  end
+  return 1
+end
+
+-- Buy one affordable Gift per call. Column 1 is the dedication tile, column 2
+-- a spacer; Gifts start at column 3. updateMinCosts has already marked every
+-- reachable cell through cell.isAvailable / cell.isBlocked.
+local function buyGiftStep(game, player)
+  local tree = game.skillTree
+  if not tree or not tree.cells or not tree.gridWidth then return false end
+  local costs = skillCostMap()
+  for y = 1, #G_Globals.skillFactions do
+    local god = G_Globals.skillFactions[y]
+    local dev = game:getDevotion(god)
+    if dev and dev > 0 and not game:isCursedByGod(god) then
+      for x = 3, tree.gridWidth do
+        local cell = tree.cells[y] and tree.cells[y][x]
+        if cell and cell.isAvailable and not cell.isBlocked and not cell.isOpen then
+          local cost = costs[cell.tileDataName]
+          if cost and dev >= cost then
+            tree:activateCellForGridFactionAtXY(x, y)
+            log("god: bought %s for %s (cost %d, devotion left %d)",
+              tostring(cell.tileDataName), god, cost, game:getDevotion(god))
+            return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
+-- In a safe town: offer any Devotional Tear (opens a god-choice box that
+-- handleDialogs answers), spend devotion on Gifts, and dedicate to CFG.god for
+-- the free boon and the full heal it grants.
+local function godStep(game, player)
+  if game:isWorldDungeon() then return false end
+  if game:isEnemyPresent() then return false end
+  if game.confirmBox and game.confirmBox.isOpen then return false end
+  if game.multiChoiceBox and game.multiChoiceBox.isOpen then return false end
+  if not player:isFreeToMove() then return false end
+
+  local tear = player:findInventoryObjectWithName("devotional_tear")
+  if tear and not S.tearPending then
+    S.tearPending = true
+    S.tearID = tear.ID
+    game:startShatteringTear(tear.ID)
+    log("god: offering a Devotional Tear to %s", tostring(CFG.god))
+    return true
+  end
+
+  if buyGiftStep(game, player) then return true end
+
+  if CFG.god and G_Globals.godData[CFG.god] and not game:getCurrentGod()
+    and not game:isCursedByGod(CFG.god) then
+    if now() - (S.dedicateTriedAt or -100) > 10 then
+      S.dedicateTriedAt = now()
+      log("god: dedicating to %s", CFG.god)
+      game:devoteToGod(CFG.god)
+      return true
+    end
+  end
+  return false
+end
+
 -- Yarrow has two Large Healing Potions lying around (a crate at 34,64 and an
 -- object at 31,45). They are the difference between losing and winning the
 -- silverwolf fight, so grab them before heading to the cave.
@@ -2430,6 +2517,12 @@ local function townSupplyStep(game, player)
 end
 
 local function handleDialogs(game)
+  if S.tearPending and game.multiChoiceBox and game.multiChoiceBox.isOpen then
+    S.tearPending = false
+    local ok, err = pcall(game.finishShattering, game, godIndex(CFG.god), "", S.tearID)
+    if not ok then log("god: tear offering failed: %s", tostring(err)) end
+    return true
+  end
   if game.alertBox and game.alertBox.isOpen then
     pressKey("return")
     return true
@@ -2616,6 +2709,9 @@ local function tickWorld(game, player)
       S.nextTown = nil
       log("CAMPAIGN: arrived in %s", name)
     end
+
+    -- Boons first: offerings, Gifts and dedication only happen in safe towns.
+    if godStep(game, player) then return end
 
     local target = data.leadsTo
     local delve = target and not S.dungeonDone[target]

@@ -561,3 +561,27 @@ la llave (`exit-explore`) solo se hace si hay vida > 60 % y alguna fuente de
 curación (poción o lifestone); si no, va directo a las escaleras de salida.
 Test36 arrancó desde el checkpoint del save del usuario (Overworld 267,223),
 entró a Moon-upon-Thoss y siguió a la mazmorra sin errores.
+
+## 2026-10-30 — Dioses: dedicación, lágrimas y compra de Gifts
+
+Mecánica leída del código:
+
+- Pantalla de dioses = `game.skillTree`; comprar un Gift es exactamente
+  `game.skillTree:activateCellForGridFactionAtXY(x, y)` (la UI hace lo mismo).
+  Los costes viven en la tabla local `skillTileData` de `skill_tree.lua`; el bot
+  parsea el fichero instalado (`love.filesystem.read`) para conocerlos y no
+  comprar sin devoción.
+- `game:devoteToGod(god)` abre un confirmBox; al confirmarlo,
+  `actuallyDedicateToGod` activa el boon del dios (p. ej. Death's Harlequin:
+  Frolic), cura vida/poise/comida al máximo y maldice a los dioses rivales.
+- Las Devotional Tears se ofrecen con `game:startShatteringTear(id)` (abre un
+  multiChoiceBox con 5 dioses) y se rematan con `finishShattering(index,...)`;
+  `handleDialogs` del bot elige `ZZBOT_GOD`.
+- Devoción por dios: `game:getDevotion(god)`; compra un Gift por tick en
+  pueblos seguros (`godStep`, solo si no hay enemigos ni otra UI abierta).
+
+Decisión por defecto: `ZZBOT_GOD=deathsHarlequin` porque el bot usa daga y
+huye (la restricción de Wolf es huir; la de Dust, pociones; la de Harlequin
+solo prohíbe hachas/espadas/mazas y mejora ganzúa/dodge/evasión de trampas).
+Pendiente: equipamiento debe respetar el tabú (no equipar espadas/mazas), y
+buscar Devotional Tears en mazmorras para comprar más Gifts.
