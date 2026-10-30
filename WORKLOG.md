@@ -815,3 +815,40 @@ reales pero modestos con poco capital (el margen máximo teórico es
 de mazmorra y las recompensas por rescatar mercaderes; el arbitraje escala
 cuando haya más guineas. La asignatura pendiente sigue siendo sobrevivir a
 los Zooms.
+
+### Test46 — oro → devoción: comprar descubrimientos y Gifts baratos
+
+No existe donar dinero por devoción: el logro `blindAngels.donate` está
+comentado en `achievements.lua:56` y los cofres de donación solo suben
+reputación (precios ±20%). El camino real oro → poder:
+
+- `addObjectToInventory` (actor.lua:6811-6820) llama `processAchievement` con
+  el nombre del objeto para pociones, ungüentos y varas, así que **comprar**
+  un tipo desconocido cuenta para `discoverAllPotions` (15 tipos, +2 para la
+  Lady) y `discoverAllWands` (12 tipos, +2 para los Lords of Dust).
+- Las tiendas de las 5 ciudades venden exactamente **15 tipos** de
+  poción/ungüento entre todas (agua, curación, energía, antídotos, venenos...),
+  es decir, el primer logro se completa solo comprando. De varas solo hay 3
+  tipos en stock (750–1100); los otros 9 salen del loot de mazmorra.
+- Cada Gift da siempre +5 al atributo de su dios, así que comprar primero los
+  de coste 1 (berserk/luck/puppet/revelation/gash/life_sight) maximiza la
+  fuerza por punto de devoción. `buyGiftStep` ahora ordena por coste.
+
+Implementación: `discoveryStep` compra una unidad de cada tipo desconocido
+(reserva intacta para el ferry; prioriza pociones sobre varas) y `buyGiftStep`
+elige el Gift alcanzable más barato. Diagnóstico de alerts añadido
+(`alert:` con texto/fracción/delay).
+
+Pruebas:
+
+- `logs/discovery1.log`: venta 100→304; compra `potion_water` 78 (potions
+  2/15); ferry 150; Barrow-Linn +2 → `revelation` (coste 1); Harrowdus +2 →
+  `luck` + `puppet` (1+1). Un alert quedó abierto en la entrada de Harrowdus
+  (no reproducido después; el diagnóstico lo vigila).
+- `logs/discovery2.log`: Harrowdus/Hearthaven ya visitadas, +2 → `life_sight`
+  (coste 1); muere en Zoom 47,49 contra moonbear + 2 moonmoths + moonmage
+  (400→0 en ~2 s). Sigue siendo la debilidad #12, no la economía.
+
+Pendiente para el plan de farmeo: barrido de loot (#9, también necesario para
+las 9 varas que no se venden), equipo/inventario (#10), poderes divinos en
+combate (#11) y supervivencia en Zooms (#12).

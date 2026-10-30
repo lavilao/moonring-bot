@@ -100,7 +100,11 @@ rm -rf work/xdg/love/moonring-bot/data/save_backup/* work/xdg/love/moonring-bot/
    su mazmorra vía `leadsTo`.
 4. **Gira de devoción**: antes de las mazmorras de campaña visita las 5
    ciudades natales de los dioses (+2 de devoción por logro), compra Gifts con
-   esa devoción y, al terminar la gira, se dedica al dios configurado.
+   esa devoción (empieza por los de coste 1: cada Gift da +5 al atributo de su
+   dios) y, al terminar la gira, se dedica al dios configurado. El oro no se
+   puede donar, pero sí comprar **tipos desconocidos** de poción, ungüento y
+   vara: cada tipo nuevo alimenta las Devotional Tasks de descubrimiento
+   (`discoverAllPotions` 15 tipos, +2; `discoverAllWands` 12 tipos, +2).
 5. **Economía**: vende el loot que no usa al tendero más rico allí donde la
    demanda local no sea baja (protege equipo, consumibles, llaves y encargos).
    Además hace **arbitraje**: cada ciudad tiene un offset de demanda
@@ -141,6 +145,11 @@ analisis.md            notas de mecánicas del juego
   Barrow-Linn (+19%), y compra dagas/flechas a 7 para venderlas a 9 (1.29×).
   La venta del loot de la primera mazmorra pagó el billete del ferry
   (100 → 304 guineas).
+- **Oro → devoción**: compra una unidad de cada tipo desconocido de
+  poción/ungüento/vara que ve en las tiendas (reservando el ferry) y compra
+  los Gifts alcanzables más baratos. Verificado en pruebas: `potion_water`
+  (pociones 2/15), `revelation`, `luck`, `puppet` y `life_sight`, todos de
+  coste 1.
 - **Punto débil actual**: las emboscadas Zoom aleatorias en el overworld
   (grupos de bandidos + animales) siguen matando al bot en algunos trayectos;
   cuando sobrevive, rescatar al mercader otorga ~500 guineas extra.

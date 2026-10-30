@@ -2731,11 +2731,14 @@ end
 
 -- Buy one affordable Gift per call. Column 1 is the dedication tile, column 2
 -- a spacer; Gifts start at column 3. updateMinCosts has already marked every
--- reachable cell through cell.isAvailable / cell.isBlocked.
+-- reachable cell through cell.isAvailable / cell.isBlocked. Every Gift adds
+-- the same +5 to its god's stat, so the cheapest reachable one buys the most
+-- combat strength per point of Devotion.
 local function buyGiftStep(game, player)
   local tree = game.skillTree
   if not tree or not tree.cells or not tree.gridWidth then return false end
   local costs = skillCostMap()
+  local best
   for y = 1, #G_Globals.skillFactions do
     local god = G_Globals.skillFactions[y]
     local dev = game:getDevotion(god)
@@ -2744,17 +2747,18 @@ local function buyGiftStep(game, player)
         local cell = tree.cells[y] and tree.cells[y][x]
         if cell and cell.isAvailable and not cell.isBlocked and not cell.isOpen then
           local cost = costs[cell.tileDataName]
-          if cost and dev >= cost then
-            tree:activateCellForGridFactionAtXY(x, y)
-            log("god: bought %s for %s (cost %d, devotion left %d)",
-              tostring(cell.tileDataName), god, cost, game:getDevotion(god))
-            return true
+          if cost and dev >= cost and (not best or cost < best.cost) then
+            best = { x = x, y = y, god = god, cell = cell, cost = cost }
           end
         end
       end
     end
   end
-  return false
+  if not best then return false end
+  tree:activateCellForGridFactionAtXY(best.x, best.y)
+  log("god: bought %s for %s (cost %d, devotion left %d)",
+    tostring(best.cell.tileDataName), best.god, best.cost, game:getDevotion(best.god))
+  return true
 end
 
 -- In a safe town: offer any Devotional Tear (opens a god-choice box that
@@ -3475,6 +3479,161 @@ local function tradeBuyStep(game, player)
   return false
 end
 
+-- Gold into Devotion: there is no way to donate money to a god, but acquiring
+-- an unseen potion/ointment/wand type feeds the discovery Devotional Tasks.
+-- Fifteen potion/ointment types complete discoverAllPotions (+2 Lady of the
+-- Sanguine Moon); twelve wand types complete discoverAllWands (+2 Lords of
+-- Dust). Shops sell exactly fifteen potion/ointment types between them, so one
+-- unit of each unknown type is a guaranteed two Devotion, and the three wand
+-- types restocked everywhere start the slower wand task.
+local DISCOVERY_TIER = { potion = 1, ointment = 1, wand = 2 }
+
+local function achievementsModule()
+  if S.ach then return S.ach end
+  local ok, mod = pcall(require, "achievements")
+  if ok and type(mod) == "table" and type(mod.variables) == "table" then
+    S.ach = mod
+    return mod
+  end
+  return nil
+end
+
+local function discoveryCount(ach, var)
+  return (ach and ach.variables and tonumber(ach.variables[var])) or 0
+end
+
+local function discoveryCandidates(game)
+  local ach = achievementsModule()
+  if not ach then return nil end
+  local money = playerMoney(game)
+  local reserve = tradeReserve(game)
+  local loc = game.currentWorldName
+  local out = {}
+  for _, role in ipairs(shopRoles()) do
+    local vendor = vendorForRole(game, role)
+    local stock
+    pcall(function() stock = game.economy.shopStockLevels[loc][role] end)
+    if vendor and stock then
+      for _, entry in ipairs(stock) do
+        local seen = ach.variables[entry.ID]
+        local skip = S.discBought and S.discBought[entry.ID]
+        if (entry.amount or 0) > 0 and not skip and not (seen and seen > 0) then
+          local def
+          pcall(function() def = game:getObjectDataWithObjectType(entry.ID) end)
+          local tier = def and DISCOVERY_TIER[tostring(def.category):lower()]
+          if tier then
+            local buyPrice = 0
+            pcall(function() buyPrice = game.economy:getActualBuyValue(def) end)
+            if buyPrice > 0 and money - buyPrice >= reserve then
+              out[#out + 1] = {
+                id = entry.ID, role = role, price = buyPrice,
+                tier = tier, category = def.category,
+              }
+            end
+          end
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.tier ~= b.tier then return a.tier < b.tier end
+    return a.price < b.price
+  end)
+  return out
+end
+
+local function discoverySessionStep(game, player, panel)
+  S.phase = "discovery"
+  local role = S.discRole or panel.vendorRole
+  local cands = discoveryCandidates(game)
+  local pick
+  for _, c in ipairs(cands or {}) do
+    if c.role == role then pick = c; break end
+  end
+  if pick then
+    panel.categoryIndex = 1
+    local list = panel:getSortedInventory() or {}
+    local idx
+    for i, e in ipairs(list) do
+      if e.ID == pick.id and (e.amount or 0) > 0 then idx = i; break end
+    end
+    if idx then
+      panel.sortedInventory = list
+      panel.cursorPosition = idx
+      local ok, err = pcall(panel.buy, panel, 1)
+      if not ok then
+        log("discovery: buy failed: %s", tostring(err))
+      else
+        S.discBought = S.discBought or {}
+        S.discBought[pick.id] = true
+        local ach = achievementsModule()
+        log("discovery: bought %s (%s) for %d (potions %d/15, wands %d/12, money %d)",
+          tostring(pick.id), tostring(pick.category), pick.price,
+          discoveryCount(ach, "potions_found"), discoveryCount(ach, "wands_found"),
+          playerMoney(game))
+      end
+    end
+  end
+  pcall(function() panel:setIsOpen(false, role) end)
+  player.target = nil
+  S.discActive, S.discRole = nil, nil
+  S.discCoolT, S.discCoolTown = now() + 4, game.currentWorldName
+  return true
+end
+
+local function discoveryStep(game, player)
+  local panel = game.buyPanel
+  if not panel then return false end
+  if panel.isOpen and not S.discActive then
+    if S.buyActive or S.sellActive then return false end
+    S.discActive, S.discRole = true, panel.vendorRole
+  end
+  if S.discActive then
+    if not panel.isOpen then
+      S.discActive, S.discRole = nil, nil
+      return false
+    end
+    return discoverySessionStep(game, player, panel)
+  end
+  if not (game.currentWorldData and game.currentWorldData.isTown) then return false end
+  if not player:isFreeToMove() then return false end
+  if game:isEnemyPresent() then return false end
+  if game.alertBox and game.alertBox.isOpen then return false end
+  if game.confirmBox and game.confirmBox.isOpen then return false end
+  if game.multiChoiceBox and game.multiChoiceBox.isOpen then return false end
+  if game.speechArea and game.speechArea.isOpen then return false end
+  if game.sellPanel and game.sellPanel.isOpen then return false end
+  if S.discCoolTown == game.currentWorldName and now() < (S.discCoolT or 0) then
+    return false
+  end
+  local cands = discoveryCandidates(game)
+  if not cands or #cands == 0 then return false end
+  local pick = cands[1]
+  local vendor = vendorForRole(game, pick.role)
+  if not vendor then return false end
+  local px, py = playerPos(player)
+  local ax, ay = vendor.position.x, vendor.position.y
+  if math.abs(ax - px) + math.abs(ay - py) == 1 then
+    player.target = vendor
+    panel.categoryIndex = 1
+    local ok, err = pcall(function() panel:setIsOpen(true, pick.role) end)
+    if not ok then
+      player.target = nil
+      log("discovery: cannot open %s: %s", tostring(pick.role), tostring(err))
+      return false
+    end
+    S.discActive, S.discRole = true, pick.role
+    log("discovery: next unknown %s (%s) at %d from %s",
+      tostring(pick.id), tostring(pick.category), pick.price, tostring(pick.role))
+    return true
+  end
+  if walkNextToActor(game, player, vendor) then
+    S.phase = "to-discovery"
+    return true
+  end
+  return false
+end
+
 
 local function handleDialogs(game)
   if S.tearPending and game.multiChoiceBox and game.multiChoiceBox.isOpen then
@@ -3484,6 +3643,19 @@ local function handleDialogs(game)
     return true
   end
   if game.alertBox and game.alertBox.isOpen then
+    local ab = game.alertBox
+    local text = tostring(ab.bodyText or ""):gsub("%s+", " ")
+    if S.alertText ~= text then
+      S.alertText, S.alertSince = text, now()
+      log("alert: '%s' (fraction %.2f delay %.2f boxes %d)",
+        text:sub(1, 160), ab.fraction or -1, ab.delayTime or -1,
+        #(ab.boxArray or {}))
+    elseif now() - (S.alertSince or 0) > 6 and now() - (S.alertLogT or 0) > 6 then
+      S.alertLogT = now()
+      log("alert stuck: '%s' fraction=%.2f delay=%.2f boxes=%d",
+        text:sub(1, 160), ab.fraction or -1, ab.delayTime or -1,
+        #(ab.boxArray or {}))
+    end
     pressKey("return")
     return true
   end
@@ -3615,6 +3787,7 @@ local function tickWorld(game, player)
     S.zoomExit = nil
     S.sellActive, S.sellRole = nil, nil
     S.buyActive, S.buyRole = nil, nil
+    S.discActive, S.discRole = nil, nil
     S.worldChanges = (S.worldChanges or 0) + 1
     overRoute.path, overRoute.failTarget, overRoute.failWorld = nil, nil, nil
     ferryRoute.goal, ferryRoute.path, ferryRoute.failed = nil, nil, false
@@ -3705,6 +3878,10 @@ local function tickWorld(game, player)
 
     -- Sell surplus loot before leaving town; the ferry purse depends on it.
     if sellStep(game, player) then return end
+
+    -- Spend gold on unseen potion and wand types: each new type feeds the
+    -- discovery Devotional Tasks, and their rewards are Gifts (+5 stat each).
+    if discoveryStep(game, player) then return end
 
     -- Then reload the bag with goods this town prices low: the next towns on
     -- the route pay up to twice as much once their own demand is factored in.
