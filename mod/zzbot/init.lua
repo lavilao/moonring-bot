@@ -27,6 +27,12 @@ local CFG = {
   shotEvery = tonumber(os.getenv("ZZBOT_SHOT_INTERVAL")),
   god       = os.getenv("ZZBOT_GOD") or "deathsHarlequin",
   tour      = (os.getenv("ZZBOT_TOUR") ~= "0"),
+  moneyReserve = tonumber(os.getenv("ZZBOT_MONEY_RESERVE")) or 150,
+  sellHold  = tonumber(os.getenv("ZZBOT_SELL_HOLD")) or 0.95,
+  trade     = (os.getenv("ZZBOT_TRADE") ~= "0"),
+  tradeMargin = tonumber(os.getenv("ZZBOT_TRADE_MARGIN")) or 1.20,
+  tradeTake = tonumber(os.getenv("ZZBOT_TRADE_TAKE")) or 1.10,
+  tradeDebug = (os.getenv("ZZBOT_TRADE_DEBUG") == "1"),
 }
 
 local S = {
@@ -2373,7 +2379,9 @@ local function overworldTravelStep(game, player, target)
     end
   end
   if not dx then
-    dx, dy = ferryLegStep(game, player, target)
+    local fdx, fdy = ferryLegStep(game, player, target)
+    if fdx == true then return true end -- Return pressed at the gate/dock
+    dx, dy = fdx, fdy
   end
   if dx then
     local bx, by = px + dx, py + dy
@@ -2755,6 +2763,7 @@ end
 local function godStep(game, player)
   if game:isWorldDungeon() then return false end
   if game:isEnemyPresent() then return false end
+  if game.sellPanel and game.sellPanel.isOpen then return false end
   if game.confirmBox and game.confirmBox.isOpen then return false end
   if game.multiChoiceBox and game.multiChoiceBox.isOpen then return false end
   if not player:isFreeToMove() then return false end
@@ -2847,14 +2856,18 @@ end
 -- handleDialogs confirms, then the game runs the whole crossing (zoom out,
 -- teleport, fade). Moon-upon-Thoss is the gate to the Barrow-Linn isle; the
 -- dock town beside Barrow-Linn sails back for free.
+local function playerMoney(game)
+  local money = 0
+  pcall(function() money = game:getPlayerStats().money or 0 end)
+  return money
+end
+
 local function ferryFare(game)
   local price = 150
   pcall(function()
     price = game.economy:getNonObjectActualPrice(G_Globals.ferryCost)
   end)
-  local money = 0
-  pcall(function() money = game:getPlayerStats().money or 0 end)
-  return price, money
+  return price, playerMoney(game)
 end
 
 local function ferryStep(game, player)
@@ -2889,6 +2902,580 @@ local function ferryStep(game, player)
   return true
 end
 
+-- ---------------------------------------------------------------------------
+-- Economy. Each town prices every object with a demand offset (0.7-1.5) and
+-- each shopkeeper has a limited purse, so surplus loot goes to the richest
+-- shop. Keep the best gear and a consumable reserve; once the purse is
+-- comfortable, hold goods this town dislikes so a later stop pays more for
+-- them (the same demand mechanic that makes local prices swing 2x).
+local SELL_KEEP_CATEGORY = { key = true, quest = true, deed = true, lamp = true,
+  scroll = true, wand = true, artifact = true }
+local WEAR_SLOTS = { melee = true, ranged = true, head = true, body = true,
+  hands = true, feet = true, neck = true, cloak = true, shield = true }
+local SELL_RESERVE = {
+  potion_heal_major = 2, potion_heal = 2, potion_cureall = 1,
+  potion_oil = 1, kindling = 3,
+}
+local CATEGORY_RESERVE = { food = 3, potion = 2, ointment = 2, medicine = 2, oil = 1 }
+-- Never restock the bag with things the combat layer will consume or that
+-- sellPlan keeps forever: the unit cost tag would leak or the money is lost.
+local TRADE_SKIP = {
+  potion_heal = true, potion_heal_major = true,
+  camp_kit = true, wand_of_healing = true,
+}
+
+local function objBasePrice(game, o)
+  local def
+  pcall(function() def = game:getObjectDataWithObjectType(o.objectType) end)
+  return def and tonumber(def.price) or 0
+end
+
+local function objSellValue(game, o)
+  local v = 0
+  pcall(function() v = game.economy:getActualSellValue(o) end)
+  return v or 0
+end
+
+local function townDemand(game, o)
+  local d = 1
+  pcall(function()
+    local loc = game.economy:getLocalEconomyLocationName()
+    d = game.economy.townEconomies[loc].demandOffsetDictionary[o.objectType] or 1
+  end)
+  return d
+end
+
+local function isWorn(game, o)
+  local worn = false
+  pcall(function() worn = game:isObjectWornOrWielded(o) end)
+  return worn
+end
+
+-- What a town would pay for the object right now. Buying pays base x demand
+-- while selling pays base x demand x 0.65, so only a demand above ~1.55x the
+-- purchase town beats the markdown; buy low, sell high is the whole game.
+local function sellValueInTown(game, town, o)
+  local def
+  pcall(function() def = game:getObjectDataWithObjectType(o.objectType) end)
+  local price = def and tonumber(def.price) or 0
+  if price <= 0 then return 0 end
+  local mult = 1
+  pcall(function()
+    local econ = game.economy.townEconomies[town]
+    mult = econ and econ.demandOffsetDictionary[o.objectType] or 1
+    -- Towns discount whatever they produce, but that axe cuts both ways:
+    -- local goods also resell low while we stand in the town that makes them.
+    for _, use in ipairs(CEconomy.discountArray[town] or {}) do
+      if def.use == use then
+        mult = mult * G_Globals.iceToEskimosPriceMultiplier
+        break
+      end
+    end
+    mult = math.clamp(mult, G_Globals.minPriceFluctuation, G_Globals.maxPriceFluctuation)
+  end)
+  return math.floor(price * mult * G_Globals.sellMarkdownFraction)
+end
+
+-- Trade goods bought cheap are tagged with their unit cost; sellPlan only
+-- parts with them where the local sell value clears that cost with a margin.
+local function tradeTag(o)
+  local tag = S.tradeTags and S.tradeTags[o.objectType]
+  if not tag then return nil end
+  if (S.worldChanges or 0) - (tag.trip or 0) > 12 then
+    S.tradeTags[o.objectType] = nil
+    return nil
+  end
+  return tag
+end
+
+-- One item per wearable slot stays in the bag: selling spare loot must never
+-- discard the best weapon or armour the equipment layer may want later.
+local function bestGearIDs(game, inv)
+  local best, ids = {}, {}
+  for _, o in pairs(inv or {}) do
+    if WEAR_SLOTS[o.category] then
+      local value = objBasePrice(game, o)
+      if value > 0 and (not best[o.category] or value > best[o.category]) then
+        best[o.category] = value
+        ids[o.category] = o.ID
+      end
+    end
+  end
+  local keep = {}
+  for _, id in pairs(ids) do keep[id] = true end
+  return keep
+end
+
+local function hasRangedWeapon(inv)
+  for _, o in pairs(inv or {}) do
+    if o.category == "ranged" then return true end
+  end
+  return false
+end
+
+-- How many units of this object the bot is willing to part with right now.
+local function sellPlan(game, o, money, gearIDs, rangedOwned)
+  if SELL_KEEP_CATEGORY[o.category] then return false end
+  if o.objectType == "wand_of_healing" or o.objectType == "camp_kit" then
+    return false
+  end
+  if isWorn(game, o) then return false end
+  local value = objSellValue(game, o)
+  if value <= 0 then return false end
+  local tag = tradeTag(o)
+  if tag then
+    -- Trade stock is not loot: it stays until a town pays the target margin.
+    if value >= math.ceil(tag.cost * CFG.tradeTake) then
+      return true, o.count or 1
+    end
+    return false
+  end
+  local count = o.count or 1
+  local sellable
+  if WEAR_SLOTS[o.category] then
+    if gearIDs[o.ID] then return false end
+    sellable = count
+  elseif o.category == "ammo" then
+    if rangedOwned then return false end
+    sellable = count
+  elseif o.category == "tool" then
+    local reserve = SELL_RESERVE[o.objectType]
+    if not reserve then return false end
+    sellable = count - reserve
+  elseif o.category == "trade" or o.category == "reagent"
+    or o.category == "base" or o.category == "alchemy" then
+    sellable = count
+  else
+    sellable = count - (SELL_RESERVE[o.objectType] or CATEGORY_RESERVE[o.category] or 0)
+  end
+  if sellable <= 0 then return false end
+  -- Demand exploit: with money in the purse, wait for a town that wants the
+  -- good instead of dumping it at a below-average price.
+  if money >= CFG.moneyReserve and townDemand(game, o) < CFG.sellHold then
+    return false
+  end
+  return true, math.min(sellable, count)
+end
+
+local function shopRoles()
+  local list = {}
+  for role, _ in pairs(CEconomy and CEconomy.shopTypes or {}) do
+    list[#list + 1] = role
+  end
+  table.sort(list)
+  return list
+end
+
+local function shopFunds(game, role)
+  local f = 0
+  pcall(function() f = game.economy:getFundsForShopType(role) or 0 end)
+  return f
+end
+
+local function vendorForRole(game, role)
+  local a
+  pcall(function() a = game.actorManager:getActorWithRole(role) end)
+  if a and (a.isCorpse or a.isAway == true) then return nil end
+  return a
+end
+
+local function bestVendor(game)
+  local best, bestFunds, bestActor
+  for _, role in ipairs(shopRoles()) do
+    local a = vendorForRole(game, role)
+    local f = shopFunds(game, role)
+    if a and f > 0 and (not bestFunds or f > bestFunds) then
+      best, bestFunds, bestActor = role, f, a
+    end
+  end
+  return best, bestFunds, bestActor
+end
+
+local function walkNextToActor(game, player, actor)
+  local map = game.map
+  local ax, ay = actor.position.x, actor.position.y
+  local best, bestLen
+  for _, d in ipairs(DIRS) do
+    local nx, ny = ax + d[1], ay + d[2]
+    if inBounds(map, nx, ny) and cellWalkable(cellAt(map, nx, ny)) then
+      local steps = travelSteps(game, player, nx, ny)
+      if steps and steps[1] and (bestLen == nil or #steps < bestLen) then
+        best, bestLen = steps, #steps
+      end
+    end
+  end
+  if not best then return false end
+  pressDelta(best[1].x, best[1].y)
+  return true
+end
+
+-- Sell items until the shop's funds run dry, then close the panel.
+local function sellSessionStep(game, player, panel)
+  S.phase = "selling"
+  local role = S.sellRole or panel.vendorRole
+  local total, sales = 0, 0
+  for _ = 1, 25 do
+    local funds = shopFunds(game, role)
+    if funds <= 0 then break end
+    panel.categoryIndex = 1
+    local list = panel:getSortedInventory() or {}
+    local inv = game:getPlayerInventory() or {}
+    local money = playerMoney(game)
+    local gearIDs = bestGearIDs(game, inv)
+    local rangedOwned = hasRangedWeapon(inv)
+    local pick, pickCount, pickGain
+    for i, o in ipairs(list) do
+      local ok, n = sellPlan(game, o, money, gearIDs, rangedOwned)
+      local value = objSellValue(game, o)
+      if ok and value > 0 and value <= funds then
+        n = math.min(n, math.floor(funds / value))
+        if n > 0 and (not pickGain or value * n > pickGain) then
+          pick, pickCount, pickGain = i, n, value * n
+        end
+      end
+    end
+    if not pick then break end
+    panel.sortedInventory = list
+    panel.cursorPosition = pick
+    local obj = list[pick]
+    local demand = townDemand(game, obj)
+    local ok, err = pcall(panel.sell, panel, pickCount)
+    if not ok then
+      log("shop: sell failed: %s", tostring(err))
+      break
+    end
+    total = total + pickGain
+    sales = sales + pickCount
+    log("shop: sold %dx %s for %d (demand %.2f, money %d)",
+      pickCount, tostring(obj.objectType), pickGain, demand, playerMoney(game))
+    if S.tradeTags and S.tradeTags[obj.objectType] then
+      local still = false
+      for _, it in pairs(game:getPlayerInventory() or {}) do
+        if it.objectType == obj.objectType then still = true; break end
+      end
+      if not still then
+        S.tradeTags[obj.objectType] = nil
+        log("trade: %s sold out", tostring(obj.objectType))
+      end
+    end
+  end
+  pcall(function() panel:setIsOpen(false, role) end)
+  player.target = nil
+  S.sellActive = nil
+  S.sellRole = nil
+  if sales > 0 then
+    log("shop: closed, sold %d items for %d (money %d)",
+      sales, total, playerMoney(game))
+  else
+    log("shop: nothing affordable to sell (money %d)", playerMoney(game))
+  end
+  return true
+end
+
+local function sellStep(game, player)
+  local panel = game.sellPanel
+  if not panel then return false end
+  if panel.isOpen and not S.sellActive then
+    S.sellActive = true
+    S.sellRole = panel.vendorRole
+  end
+  if S.sellActive then
+    if not panel.isOpen then
+      S.sellActive, S.sellRole = nil, nil
+      return false
+    end
+    return sellSessionStep(game, player, panel)
+  end
+  if not (game.currentWorldData and game.currentWorldData.isTown) then return false end
+  if not player:isFreeToMove() then return false end
+  if game:isEnemyPresent() then return false end
+  if game.alertBox and game.alertBox.isOpen then return false end
+  if game.confirmBox and game.confirmBox.isOpen then return false end
+  if game.multiChoiceBox and game.multiChoiceBox.isOpen then return false end
+  if game.speechArea and game.speechArea.isOpen then return false end
+  local money = playerMoney(game)
+  local inv = game:getPlayerInventory() or {}
+  local gearIDs = bestGearIDs(game, inv)
+  local rangedOwned = hasRangedWeapon(inv)
+  local anything = false
+  for _, o in pairs(inv) do
+    if sellPlan(game, o, money, gearIDs, rangedOwned) then
+      anything = true
+      break
+    end
+  end
+  if not anything then return false end
+  local role, funds, vendor = bestVendor(game)
+  if not role then
+    if now() - (S.vendorLogT or 0) > 10 then
+      S.vendorLogT = now()
+      log("shop: no shopkeeper found in %s", tostring(game.currentWorldName))
+    end
+    return false
+  end
+  local px, py = playerPos(player)
+  local ax, ay = vendor.position.x, vendor.position.y
+  if math.abs(ax - px) + math.abs(ay - py) == 1 then
+    player.target = vendor
+    local ok, err = pcall(function() panel:setIsOpen(true, role) end)
+    if not ok then
+      player.target = nil
+      log("shop: cannot open %s (%s): %s",
+        role, tostring(vendor.uniqueName), tostring(err))
+      return false
+    end
+    S.sellActive = true
+    S.sellRole = role
+    log("shop: selling to %s (%s, funds %d, money %d)",
+      tostring(vendor.displayName or vendor.uniqueName), role, funds, money)
+    return true
+  end
+  if walkNextToActor(game, player, vendor) then
+    S.phase = "to-shop"
+    return true
+  end
+  if now() - (S.vendorLogT or 0) > 10 then
+    S.vendorLogT = now()
+    log("shop: %s unreachable at %d,%d", role, ax, ay)
+  end
+  return false
+end
+
+-- ---------------------------------------------------------------------------
+-- Arbitrage. Buying costs base x demand; selling pays base x demand x 0.65,
+-- and both use the per-town demand offset (0.7-1.5, with local industries at
+-- 0.75x). A good bought where demand is floored and sold where it is capped
+-- clears cost by up to 39%, so the bot buys cheap stock and only parts with it
+-- where sellPlan sees the tagged unit cost multiplied by tradeTake.
+local function tradeReserve(game)
+  local r = CFG.moneyReserve
+  -- Never spend the ferry fare while the route waits on the island crossing.
+  if game.currentWorldName == "Moon-upon-Thoss" and S.nextTown == "Barrow-Linn" then
+    local fare = ferryFare(game)
+    r = math.max(r, fare + 20)
+  end
+  return r
+end
+
+local function tradeCandidates(game)
+  local loc = game.currentWorldName
+  local money = playerMoney(game)
+  local budget = math.floor((money - tradeReserve(game)) * 0.8)
+  if budget < 10 then return nil end
+  local weight, maxBurden = 0, 0
+  pcall(function() weight, maxBurden = game:getRawPlayerBurdenAndMaxBurden(nil, false) end)
+  local room = math.max(0, math.floor(maxBurden * 0.85 - weight))
+  local cands = {}
+  for _, role in ipairs(shopRoles()) do
+    local vendor = vendorForRole(game, role)
+    local stock
+    pcall(function() stock = game.economy.shopStockLevels[loc][role] end)
+    if vendor and stock then
+      for _, entry in ipairs(stock) do
+        if (entry.amount or 0) > 0 then
+          local def
+          pcall(function() def = game:getObjectDataWithObjectType(entry.ID) end)
+          if def and (tonumber(def.price) or 0) > 0
+            and not SELL_KEEP_CATEGORY[def.category]
+            and not TRADE_SKIP[def.objectType] then
+            -- Potions, wands and berries carry no burden at all (weight 0);
+            -- they are the best trade goods, so 0 must mean "fits freely".
+            local w = tonumber(def.weight) or 0
+            if w <= room then
+              local buyPrice = 0
+              pcall(function() buyPrice = game.economy:getActualBuyValue(def) end)
+              if buyPrice > 0 then
+                local sellTown, sellPrice
+                for _, town in ipairs(TOWN_ORDER) do
+                  if town ~= loc then
+                    local v = sellValueInTown(game, town, def)
+                    if v > 0 and (not sellPrice or v > sellPrice) then
+                      sellTown, sellPrice = town, v
+                    end
+                  end
+                end
+                if sellPrice and sellPrice >= math.ceil(buyPrice * CFG.tradeMargin) then
+                  local fit = w > 0 and math.floor(room / w) or 99
+                  local qty = math.min(entry.amount or 0,
+                    math.floor(budget / buyPrice), fit, 10)
+                  if qty > 0 then
+                    cands[#cands + 1] = {
+                      role = role, id = entry.ID,
+                      buyPrice = buyPrice, sellTown = sellTown, sellPrice = sellPrice,
+                      qty = qty, weight = w,
+                      score = (sellPrice - buyPrice) * qty,
+                    }
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  table.sort(cands, function(a, b) return a.score > b.score end)
+  return cands
+end
+
+local function tradeSessionStep(game, player, panel)
+  S.phase = "trading"
+  local role = S.buyRole or panel.vendorRole
+  local budget = math.floor((playerMoney(game) - tradeReserve(game)) * 0.8)
+  local bought, spent = 0, 0
+  for _ = 1, 4 do
+    local cands = tradeCandidates(game)
+    local pick
+    for _, c in ipairs(cands or {}) do
+      if c.role == role then pick = c; break end
+    end
+    if not pick then break end
+    panel.categoryIndex = 1
+    local list = panel:getSortedInventory() or {}
+    local idx
+    for i, e in ipairs(list) do
+      if e.ID == pick.id and (e.amount or 0) > 0 then idx = i; break end
+    end
+    if not idx then break end
+    local qty = math.min(pick.qty, list[idx].amount or 0,
+      math.floor((playerMoney(game) - tradeReserve(game)) / pick.buyPrice),
+      math.floor((budget - spent) / pick.buyPrice))
+    if qty <= 0 then break end
+    panel.sortedInventory = list
+    panel.cursorPosition = idx
+    local ok, err = pcall(panel.buy, panel, qty)
+    if not ok then
+      log("trade: buy failed: %s", tostring(err))
+      break
+    end
+    S.tradeTags = S.tradeTags or {}
+    S.tradeTags[pick.id] = { cost = pick.buyPrice, trip = S.worldChanges or 0 }
+    bought = bought + qty
+    spent = spent + qty * pick.buyPrice
+    log("trade: bought %dx %s at %d -> %s @ %d (%.2fx, money %d)",
+      qty, tostring(pick.id), pick.buyPrice, pick.sellTown, pick.sellPrice,
+      pick.sellPrice / pick.buyPrice, playerMoney(game))
+  end
+  pcall(function() panel:setIsOpen(false, role) end)
+  player.target = nil
+  S.buyActive, S.buyRole = nil, nil
+  S.tradeCoolT, S.tradeCoolTown = now() + 15, game.currentWorldName
+  if bought > 0 then
+    log("trade: closed, bought %d items for %d (money %d)",
+      bought, spent, playerMoney(game))
+  end
+  return true
+end
+
+-- Opt-in (ZZBOT_TRADE_DEBUG=1): once per town, dump the best cross-town
+-- spreads in stock so the margin knobs can be tuned against real data.
+local function tradeDump(game)
+  local loc = game.currentWorldName
+  local offers = {}
+  for _, role in ipairs(shopRoles()) do
+    local vendor = vendorForRole(game, role)
+    local stock
+    pcall(function() stock = game.economy.shopStockLevels[loc][role] end)
+    if vendor and stock then
+      for _, entry in ipairs(stock) do
+        if (entry.amount or 0) > 0 then
+          local def
+          pcall(function() def = game:getObjectDataWithObjectType(entry.ID) end)
+          if def and (tonumber(def.price) or 0) > 0 then
+            local buyPrice = 0
+            pcall(function() buyPrice = game.economy:getActualBuyValue(def) end)
+            if buyPrice > 0 then
+              local sellTown, sellPrice
+              for _, town in ipairs(TOWN_ORDER) do
+                if town ~= loc then
+                  local v = sellValueInTown(game, town, def)
+                  if v > 0 and (not sellPrice or v > sellPrice) then
+                    sellTown, sellPrice = town, v
+                  end
+                end
+              end
+              if sellTown and sellPrice / buyPrice >= 1.05 then
+                offers[#offers + 1] = {
+                  id = entry.ID, role = role, buy = buyPrice, town = sellTown,
+                  sell = sellPrice, ratio = sellPrice / buyPrice,
+                  amount = entry.amount, weight = tonumber(def.weight) or 0,
+                }
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  table.sort(offers, function(a, b) return a.ratio > b.ratio end)
+  log("trade-dbg: %s money=%d offers(>=1.05x)=%d", loc, playerMoney(game), #offers)
+  for i = 1, math.min(8, #offers) do
+    local o = offers[i]
+    log("trade-dbg: %s/%s buy=%d -> %s sell=%d (%.2fx) stock=%d w=%s",
+      tostring(o.role), tostring(o.id), o.buy, o.town, o.sell, o.ratio,
+      o.amount, tostring(o.weight))
+  end
+end
+
+local function tradeBuyStep(game, player)
+  if not CFG.trade then return false end
+  local panel = game.buyPanel
+  if not panel then return false end
+  if panel.isOpen and not S.buyActive then
+    S.buyActive, S.buyRole = true, panel.vendorRole
+  end
+  if S.buyActive then
+    if not panel.isOpen then
+      S.buyActive, S.buyRole = nil, nil
+      return false
+    end
+    return tradeSessionStep(game, player, panel)
+  end
+  if not (game.currentWorldData and game.currentWorldData.isTown) then return false end
+  if not player:isFreeToMove() then return false end
+  if game:isEnemyPresent() then return false end
+  if game.alertBox and game.alertBox.isOpen then return false end
+  if game.confirmBox and game.confirmBox.isOpen then return false end
+  if game.multiChoiceBox and game.multiChoiceBox.isOpen then return false end
+  if game.speechArea and game.speechArea.isOpen then return false end
+  if game.sellPanel and game.sellPanel.isOpen then return false end
+  if S.tradeCoolTown == game.currentWorldName and now() < (S.tradeCoolT or 0) then
+    return false
+  end
+  if CFG.tradeDebug and S.tradeDumpTown ~= game.currentWorldName then
+    S.tradeDumpTown = game.currentWorldName
+    tradeDump(game)
+  end
+  local cands = tradeCandidates(game)
+  if not cands or #cands == 0 then return false end
+  local pick = cands[1]
+  local vendor = vendorForRole(game, pick.role)
+  if not vendor then return false end
+  local px, py = playerPos(player)
+  local ax, ay = vendor.position.x, vendor.position.y
+  if math.abs(ax - px) + math.abs(ay - py) == 1 then
+    player.target = vendor
+    panel.categoryIndex = 1
+    local ok, err = pcall(function() panel:setIsOpen(true, pick.role) end)
+    if not ok then
+      player.target = nil
+      log("trade: cannot open %s: %s", pick.role, tostring(err))
+      return false
+    end
+    S.buyActive, S.buyRole = true, pick.role
+    log("trade: best deal %s %d -> %s %d (%.2fx, weight %s)",
+      tostring(pick.id), pick.buyPrice, pick.sellTown, pick.sellPrice,
+      pick.sellPrice / pick.buyPrice, tostring(pick.weight))
+    return true
+  end
+  if walkNextToActor(game, player, vendor) then
+    S.phase = "to-trade"
+    return true
+  end
+  return false
+end
+
+
 local function handleDialogs(game)
   if S.tearPending and game.multiChoiceBox and game.multiChoiceBox.isOpen then
     S.tearPending = false
@@ -2917,6 +3504,13 @@ local function handleDialogs(game)
     return true
   end
   if game.multiChoiceBox and game.multiChoiceBox.isOpen then
+    -- setActive hilights the "Close" choice when one is appended, and Return
+    -- there only dismisses the box (the ferry, inn and god prompts all want
+    -- their first real option).
+    local box = game.multiChoiceBox
+    if box.isLastChoiceClose and box.cursorPosition == #box.choices then
+      box.cursorPosition = 1
+    end
     pressKey("return")
     return true
   end
@@ -3019,6 +3613,9 @@ local function tickWorld(game, player)
     S.knownCount = 0
     S.knownPX, S.knownPY = nil, nil
     S.zoomExit = nil
+    S.sellActive, S.sellRole = nil, nil
+    S.buyActive, S.buyRole = nil, nil
+    S.worldChanges = (S.worldChanges or 0) + 1
     overRoute.path, overRoute.failTarget, overRoute.failWorld = nil, nil, nil
     ferryRoute.goal, ferryRoute.path, ferryRoute.failed = nil, nil, false
     log("world changed: %s", tostring(name))
@@ -3105,6 +3702,13 @@ local function tickWorld(game, player)
 
     -- Boons first: offerings, Gifts and dedication only happen in safe towns.
     if godStep(game, player) then return end
+
+    -- Sell surplus loot before leaving town; the ferry purse depends on it.
+    if sellStep(game, player) then return end
+
+    -- Then reload the bag with goods this town prices low: the next towns on
+    -- the route pay up to twice as much once their own demand is factored in.
+    if tradeBuyStep(game, player) then return end
 
     -- The ferry is the only way on or off the Barrow-Linn isle. Sail from the
     -- Moon-upon-Thoss gate when the route points at Barrow-Linn, and from the

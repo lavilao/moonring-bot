@@ -75,6 +75,12 @@ rm -rf work/xdg/love/moonring-bot/data/save_backup/* work/xdg/love/moonring-bot/
 | `ZZBOT_GOD` | `deathsHarlequin` | Dios al que dedicar cuando la gira termine |
 | `ZZBOT_TOUR` | `1` | `0` = desactivar la gira de devoción |
 | `ZZBOT_START_TOWN` | `1` | Índice inicial en `TOWN_ORDER` |
+| `ZZBOT_TRADE` | `1` | `0` = desactivar el arbitraje de mercancías |
+| `ZZBOT_TRADE_MARGIN` | `1.20` | Margen mínimo esperado al comprar (venta ≥ 1.2× coste) |
+| `ZZBOT_TRADE_TAKE` | `1.10` | Umbral para vender mercancía comprada (≥ 1.1× coste) |
+| `ZZBOT_TRADE_DEBUG` | `0` | `1` = volcar en el log los mejores spreads de cada ciudad |
+| `ZZBOT_MONEY_RESERVE` | `150` | Guineas intocables (ferry, posada, imprevistos) |
+| `ZZBOT_SELL_HOLD` | `0.95` | Con reserva cubierta, no vender si la demanda local es menor |
 | `ZZBOT_MODEL` | `0` | `1` = usar el modelo Monte Carlo en combate |
 | `ZZBOT_MODEL_N` | `64` | Muestras del modelo |
 | `ZZBOT_ALPHA` | `0.08` | Tolerancia de riesgo del modelo |
@@ -95,7 +101,16 @@ rm -rf work/xdg/love/moonring-bot/data/save_backup/* work/xdg/love/moonring-bot/
 4. **Gira de devoción**: antes de las mazmorras de campaña visita las 5
    ciudades natales de los dioses (+2 de devoción por logro), compra Gifts con
    esa devoción y, al terminar la gira, se dedica al dios configurado.
-5. **Overworld**: ruta global sobre `data/save/Overworld.png` (BFS 512×512).
+5. **Economía**: vende el loot que no usa al tendero más rico allí donde la
+   demanda local no sea baja (protege equipo, consumibles, llaves y encargos).
+   Además hace **arbitraje**: cada ciudad tiene un offset de demanda
+   (0.7×–1.5×) por objeto y descuenta un 25% sus productos locales; comprar
+   cuesta `precio × demanda` y vender paga `precio × demanda × 0.65`, así que
+   el bot compra existencias baratas (con reserva de dinero intacta) y las
+   etiqueta con su coste; solo las vende donde el valor local supera el coste
+   con margen (`ZZBOT_TRADE_MARGIN`/`ZZBOT_TRADE_TAKE`). Comprar sube la
+   demanda local y vender la baja, así que los beneficios se agotan solos.
+6. **Overworld**: ruta global sobre `data/save/Overworld.png` (BFS 512×512).
    El mundo es un archipiélago: Barrow-Linn solo se alcanza con el
    **transbordador** de Moon-upon-Thoss (121–150 guineas; vuelta gratis desde
    `Barrow-Linn-Ferry`). El bot va a la puerta de Moon-upon-Thoss, entra y
@@ -117,13 +132,18 @@ analisis.md            notas de mecánicas del juego
 
 ## Estado actual y limitaciones
 
-- La gira de devoción, el ferry y la ruta del overworld están implementados;
-  el último test llegó a la puerta de Moon-upon-Thoss y al ferry.
-- **Bloqueo actual**: el billete cuesta ~121 y el personaje de prueba tiene
-  100; falta implementar venta de loot/economía para costearlo. Mientras
-  tanto el bot espera en la ciudad (`phase=ferry-poor`).
-- Supervivencia en emboscadas Zoom aleatorias (huir de un grupo entero en
-  campo abierto) todavía es frágil.
+- La gira de devoción, el ferry y la ruta del overworld están implementados; el
+  bot visita Barrow-Linn y Harrowdus (+2 de devoción en cada una) y sigue la
+  gira.
+- La economía funciona: vende el loot que no usa (protegiendo equipo,
+  consumibles y encargos) al tendero más rico y hace arbitraje de demanda.
+  Verificado: compra `potion_water` a 78 en Moon-upon-Thoss y la vende a 93 en
+  Barrow-Linn (+19%), y compra dagas/flechas a 7 para venderlas a 9 (1.29×).
+  La venta del loot de la primera mazmorra pagó el billete del ferry
+  (100 → 304 guineas).
+- **Punto débil actual**: las emboscadas Zoom aleatorias en el overworld
+  (grupos de bandidos + animales) siguen matando al bot en algunos trayectos;
+  cuando sobrevive, rescatar al mercader otorga ~500 guineas extra.
 - Pendiente: barrido de loot más fino, inventario/equipo respetando el tabú
   del dios (Harlequin prohíbe hachas/espadas/mazas), poderes divinos en
   combate y diálogo con NPCs.

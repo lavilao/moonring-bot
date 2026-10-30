@@ -725,3 +725,93 @@ primera mazmorra y tiendas (`CEconomy`), pero vender objetos aún no está
 implementado (tarea #9/#10). Alternativa: cargar un baseline con más dinero
 (el save del usuario en 221,239 lo tiene, pero está en un bolsillo con
 perseguidores).
+
+### Test42 — venta de loot y el "Close" que se comía el ferry
+
+Primera pasada de la capa de economía (`sellStep`/`sellSessionStep`). El bot
+eligió al tendero más rico con actor presente (Ozara, `items`, fondos 5499),
+se le acercó, abrió el panel de venta y liquidó lo que no usa:
+`1x potion_oil` (182), `2x kindling` (16), `2x apple` (6); **5 objetos, 204
+guineas, dinero 100 → 304**. La política protege equipo puesto/mejor por
+ranura, reservas de consumibles, llaves/encargos y no vende si la demanda
+local es < 0.95 con la reserva cubierta (`ZZBOT_MONEY_RESERVE=150`,
+`ZZBOT_SELL_HOLD=0.95`).
+
+Dos bugs de la ruta del ferry salieron a la luz:
+
+- `CMultiChoiceBox:setActive(..., include_default_close=true)` añade "Close" y
+  deja el cursor en ella, así que el Return del bot solo cerraba la caja y el
+  ferry nunca zarpaba ("boarding ..." en bucle). `handleDialogs` ahora mueve el
+  cursor a la primera opción real antes de pulsar Return.
+- `ferryLegStep` devuelve `true` (booleano) al pulsar Return en la puerta;
+  `overworldTravelStep` lo trataba como `dx` y reventaba con
+  "attempt to perform arithmetic on local 'dx' (a boolean value)".
+
+Baseline: `work/save-backup/save-test42-econ-before` (Moon-upon-Thoss, 100
+guineas, loot de la primera mazmorra en el inventario).
+
+### Test43 — la venta paga el pasaje; primera devoción; muerte en Zoom
+
+Con los dos arreglos, `logs/econ2.log`:
+
+- Venta a Ozara 5 objetos → 304 guineas (dinero 100).
+- `ferry: boarding at Moon-upon-Thoss for Barrow-Linn` → desembarco en la isla
+  (192,292), entrada en Barrow-Linn y **+2 devoción** (`homeTown3`, lordsOfDust;
+  quedan 4 ciudades-dios).
+- Vuelta gratis desde `Barrow-Linn-Ferry` a Moon-upon-Thoss (248,244).
+- Camino de Harrowdus: un marcador `Zoom` en 48,48 abre emboscada y el bot cae
+  en 48,50 (400/400 → 0, turno 1790). No es un fallo de economía: es la
+  fragilidad conocida ante Zooms (tarea #12).
+
+Queda pendiente explotar la demanda al revés: comprar barato donde el offset
+está en el suelo (0.7×) y vender caro donde está arriba (1.5×0.65 ≈ 0.975×).
+
+### Test44 — arbitraje de demanda: datos reales y bug del peso 0
+
+Con `ZZBOT_TRADE_DEBUG=1` el bot volcó en cada ciudad los mejores spreads de
+su stock. Datos clave (seed del baseline):
+
+- Moon-upon-Thoss: `potion_water` compra 78 → Barrow-Linn vende 94 (1.21×),
+  stock 5; `rosetta` 788 → 969 (1.23×); `hull_patch` 161 → 189 (1.17×).
+- Barrow-Linn: `minor_construct` 1400 → Hearthaven 1880 (1.34×);
+  `broken_minor_construct` 157 → Harrowdus 195 (1.24×).
+- Harrowdus: `throwing_daggers` 7 → Barrow-Linn 9 (1.29×, stock 20);
+  `arrow` 7 → The_Red_Grove 9; `silverwolf_hide` 157 → 188 (1.20×).
+
+La primera pasada no compró nada porque el filtro de peso exigía `w > 0` y
+**la mitad del stock útil es ingrávido** (pociones, varas, bayas: weight 0).
+Arreglos:
+
+- Peso 0 = "cabe siempre"; la puntuación pasa a beneficio total esperado
+  (`(venta-compra) × cantidad`), más el tope de carga al 85%.
+- Presupuesto: 80% del dinero por encima de la reserva (antes 50%, mínimo 20).
+  En Moon-upon-Thoss con 304 guineas el presupuesto es 107.
+- La reserva incluye el billete del ferry mientras el destino sea Barrow-Linn
+  (`tradeReserve`), para no quedarse varado tras comprar.
+- `TRADE_SKIP`: nunca comprar para revender pociones de curación (el combate
+  se las bebe) ni el camp kit / vara de curación (nunca se venden).
+- Tope por sesión: el gasto no supera el presupuesto restante aunque se
+  compren hasta 4 tipos distintos del mismo tendero.
+
+### Test45 — ida y vuelta completa: 78 → 93
+
+`logs/trade2.log`:
+
+- Venta del loot a Ozara: 100 → 304 guineas.
+- Compra de 1× `potion_water` a 78 en Moon-upon-Thoss (dinero 226; la reserva
+  mantiene el billete de 150).
+- Ferry a Barrow-Linn (dinero 76), venta de la poción a Illith por **93**
+  (+19%, etiqueta cerrada: "trade: potion_water sold out").
+- Vuelta gratis, camino a Harrowdus. En dos Zooms el bot sobrevivió y rescató
+  a un mercader: **+573 guineas** (recompensa `money_medium` por ayudar en la
+  batalla), dinero 742.
+- En Harrowdus compró 10× `throwing_daggers` (7 → Barrow-Linn 9) y 10×
+  `arrow` (7 → The_Red_Grove 9): 20 objetos por 140, ambos ingrávidos.
+- Murió en otro Zoom camino de Hearthaven (58,51) antes de revender las dagas.
+
+Conclusión: el bucle compra-barato/vende-caro funciona y los beneficios son
+reales pero modestos con poco capital (el margen máximo teórico es
+1.5×0.65/0.7 = 1.39×). La fuente grande de dinero a corto plazo son el loot
+de mazmorra y las recompensas por rescatar mercaderes; el arbitraje escala
+cuando haya más guineas. La asignatura pendiente sigue siendo sobrevivir a
+los Zooms.
