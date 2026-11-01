@@ -59,6 +59,24 @@ cp -a work/save-backup/save-075659/. work/xdg/love/moonring-bot/data/save/
 rm -rf work/xdg/love/moonring-bot/data/save_backup/* work/xdg/love/moonring-bot/data/save_failed/*
 ```
 
+`tools/milestone.sh NOMBRE` copia el guardado jugable actual a
+`work/save-backup/save-NOMBRE` para usarlo como escenario de regresión.
+
+### Eventos y regresión
+
+El mod escribe líneas `EV|t=…|kind=…|k=v…` en `ZZBOT_LOG` además del log
+humano. `tools/check_log.lua` afirma sobre ellas (`level_enter`,
+`dungeon_done`, `confirm`, `death`, `stuck`, `alert_stuck`…).
+`tools/regress.sh` ejecuta cada escenario de `tools/scenarios/*.conf` en un
+`XDG_DATA_HOME` desechable (`work/xdg-regress/<nombre>`), así que el guardado
+jugable de `work/xdg` nunca se toca; restaura un baseline, lanza el bot sin
+ventana y aplica las aserciones.
+
+```bash
+tools/regress.sh --list
+tools/regress.sh smoke yarrow
+```
+
 ## Variables de entorno
 
 | Variable | Default | Descripción |
@@ -129,6 +147,10 @@ mod/zzbot/model.lua    modelo de combate Monte Carlo
 tools/build.sh         extrae Moonring e inyecta el mod
 tools/fetch-love.sh    descarga LÖVE 11.5
 tools/run.sh           arranca la copia moddeada con guardado aislado
+tools/regress.sh       escenarios headless desde work/save-backup
+tools/check_log.lua    aserciones sobre los eventos EV| del log
+tools/milestone.sh     copia el guardado jugable a work/save-backup
+tools/scenarios/       escenarios de regresión (baseline + aserciones)
 tools/test_model.lua   simulación/pruebas del modelo
 WORKLOG.md             bitácora de desarrollo (decisiones, tests, bugs)
 analisis.md            notas de mecánicas del juego
@@ -136,6 +158,14 @@ analisis.md            notas de mecánicas del juego
 
 ## Estado actual y limitaciones
 
+- **P0 del plan**: log de eventos `EV|`, watchdog de diálogos con escalado
+  (Return → espacio → Escape → cierre por API), guardia de confirmaciones por
+  texto (declina robo, donación, salir al título/borrar, sacrificios y prompts
+  desconocidos; acepta salir del Zoom y dedicarse; las entradas a mazmorra solo
+  cuando la campaña ha llevado allí) y arnés de regresión headless.
+- Las confirmaciones de robo `Do you want to steal?` ya se declinan; el bot
+  paga las grievences (`You cannot use this ability…`) antes de salir de la
+  ciudad, que antes lo dejaban atrapado contra la puerta.
 - La gira de devoción, el ferry y la ruta del overworld están implementados; el
   bot visita Barrow-Linn y Harrowdus (+2 de devoción en cada una) y sigue la
   gira.

@@ -852,3 +852,161 @@ Pruebas:
 Pendiente para el plan de farmeo: barrido de loot (#9, también necesario para
 las 9 varas que no se venden), equipo/inventario (#10), poderes divinos en
 combate (#11) y supervivencia en Zooms (#12).
+
+### Test47 — P0 del plan: eventos EV|, watchdog de diálogos, guardia de confirmaciones y arnés de regresión
+
+Primer incremento del `PLAN.md` (fase P0), sin cambiar el objetivo de campaña:
+
+- **Log de eventos** `EV|t=…|kind=…|k=v…` en el mismo `ZZBOT_LOG` (el log
+  humano no cambia). Instrumentados `level_enter` (con `from`), `dungeon_done`,
+  `campaign_done`, `death` (con últimos mensajes), `timeout`, `stuck`
+  (dungeon/no-progress/force-close), `alert_stuck`, `bot` (continue/fresh,
+  toggle), `confirm` (clase + decisión) y `confirm_unknown`.
+- **Watchdog de diálogos** (`tick`, antes de `handleDialogs`): escalda
+  Return → espacio → Escape → cierre por API a los 6/10/14/18 s de un mismo
+  diálogo. Clave: el temporizador **sobrevive 2 s a que la caja se cierre y se
+  reabra con la misma firma**, porque el bucle de grievance consistía en
+  cerrar el alert y reabrirse en el mismo tick (la firma cambiaba y el
+  watchdog anterior nunca disparaba).
+- **Guardia de confirmaciones por texto**: antes se aceptaba todo
+  (`confirmBox.confirm = true`), incluido `Do you want to steal?`. Ahora se
+  clasifica el `bodyText`: robo/apostasía/título/salir del juego/borrar/salto
+  al vacío/sacrificio/donación/desechar/reparar se declinan; `Leave this
+  area?` (zoom) y dedicación se aceptan; las entradas a mazmorra (reliquia,
+  mini, endless, tether, doom, arena) solo se aceptan si la campaña ha traído
+  al bot aquí (`phase=to-dungeon` o `entered`) y lo desconocido se declina con
+  `confirm_unknown`.
+- **Grievances**: al recorrer la ciudad el bot embestía aldeanos y quedaba
+  atrapado: dormir y `Leave this area?` fallan mientras haya una grievance
+  (`state_game.lua:11620`) y la puerta solo produce el alert. `grievanceStep`
+  paga la deuda con el diálogo propio del juego (`openPayGrievance`) antes de
+  gastar en otra cosa; sin dinero emite `stuck source=grievance-poor`.
+- **Arnés**: `tools/check_log.lua` (aserciones `kind[@campo=valor][>=N]`,
+  `!kind` prohíbe), `tools/regress.sh` (escenarios `tools/scenarios/*.conf`
+  con baseline, timeout y aserciones; cada uno usa su propio
+  `work/xdg-regress/<nombre>`) y `tools/milestone.sh`.
+
+Pruebas:
+
+- `tools/regress.sh smoke` (save-test43-loop, Overworld 248,244): antes el bot
+  se congelaba 60 s contra el alert de grievance de Barrow-Linn; ahora paga
+  `grievance: paying 20G to villager`, acepta `Leave this area?`, avanza la
+  ruta a Harrowdus y muere en la emboscada Zoom de Barrow-Linn-Ferry (35 s,
+  debilidad P5, no regresión). Aserciones: `level_enter` (10), `!alert_stuck`,
+  `bot@state=continue` → PASS.
+- `tools/regress.sh yarrow` (save-075659): gira Yarrow → Barrow-Linn →
+  Harrowdus → Hearthaven, sin `alert_stuck` ni `confirm_unknown`; muere en el
+  tercer Zoom (bats, hp 400→0 con el modelo actual). Aserciones PASS.
+- Los dos escenarios mueren por la debilidad conocida de Zoom: sirven para
+  instrumentación, no como prueba de supervivencia.
+
+Pendiente inmediato (P1): ledger por nivel y barrido completo de loot, evitando
+de paso pisar actores no hostiles en ciudad (causa de las grievances).
+
+### Test48 — P1: ledger por nivel, barrido completo de loot y ruta estricta por towns
+
+Segundo incremento del `PLAN.md` (fase P1), sobre el arnés de Test47:
+
+- **Ledger por mundo** (`Loot.rec(world)`): `known`, `knownCount`,
+  `containers`, `visited`, `done`, `fp` (huella walkable/contenedores/fnUp/
+  fnDown). Antes `S.known` se borraba en cada cambio de mundo, así que volver a
+  un nivel lo re-exploraba; y la huella detecta niveles regenerados (muerte o
+  reset) y emite `level_reset`, limpiando el registro viejo.
+- **Barrido de contenedores** `Loot.sweepStep`: escanea el mapa cada ~1 s,
+  registra `container_seen` y abre uno a uno los contenedores alcanzables
+  (arcas, barriles, cajas, ollas, estanterías). Un contenedor bloqueado sin
+  `chest_key`/`key_master`/ganzúa se anota `container_skip reason=locked_*`
+  sin bloquear el nivel; `noPath` sostenido lo anota `unreachable`. Se eliminó
+  el gate de HP>60 %, así que el barrido corre siempre, también herido.
+- **Fin de nivel** `level_done` solo después de contenedores + frontera +
+  puertas secretas + puertas + objetivos. El descenso ya no ocurre antes.
+- **Escaleras por trigger** `Loot.stairsStep(action, phase)` con `fnDown`/
+  `fnUp`; con la Master Key baja a cualquier nivel inferior cuyo registro no
+  esté `done` y luego sube nivel a nivel hasta salir por `fnUp`.
+- **Caza del key carrier** `Loot.huntStep` en el fondo sin llave: persigue al
+  enemigo matable más cercano aunque no esté a la vista.
+- **Ruta de campaña estricta** (bug observado en Test47): `tourActive` era
+  verdadero en *cualquier* town mientras quedara algún god town pendiente, y
+  bloqueaba `delve`, así que Yarrow nunca entraba a su mazmorra y la ruta
+  saltaba directo a Barrow-Linn → Harrowdus. Ahora el orden es siempre
+  `TOWN_ORDER`: la mazmorra del town actual (`leadsTo`) se limpia antes de
+  salir; la lista de god towns solo registra visitas (+2 devotion) y no
+  reordena la campaña ni retrasa mazmorras.
+- **Escenario `dungeon`** (`save-dungeon-start`): derivado de `save-075659`
+  reescribiendo `game.sav` (bitser) y `checkpoint.txt` al `playerStart` de
+  `firstDungeon-01` (41,68). Resultado: abre 15 contenedores
+  (`container_open`), 20 vistos, 1 anotado, sin muerte ni stuck, sin
+  `confirm_unknown`; timeout a los 240 s aún en combate/barrido. PASS.
+- **Escenarios de arranque limpio**: `newgame.conf` usa un directorio de save
+  vacío (`save-empty`): el bot arranca partida nueva desde el título
+  (`bot@state=fresh`) y debe entrar a la mazmorra de Yarrow antes de pisar el
+  overworld.
+
+Pendiente inmediato: verificar `newgame`/`yarrow` con la ruta estricta; si la
+partida nueva muere en la cueva, la debilidad es de combate (P5), pero el
+evento `dungeon_done` debe verse cuando la limpieza termine.
+
+### Test49 — Fugas de la cadena del cofre de salida
+
+La partida nueva (`newgame`) entró a `firstDungeon-01` desde Yarrow, mató al
+silverwolf, tomó la `chest_key` y abrió el cofre de salida (Master Key). Pero
+la cadena del cofre seguía apuntando a él después de abrirlo: `approachCell`
+devuelve true aunque el bump no haga nada, así que el bot se quedó 400 s
+embistiendo un cofre ya saqueado y **nunca ejecutó `Loot.sweepStep`** (cero
+eventos `container_seen`). Arreglos:
+
+- La cadena del cofre de salida solo corre si **no** se tiene `key_master`.
+- Solo se apunta al cofre si su celda sigue siendo `chestLocked`/`chestClosed`
+  (`chestWorkable`); un cofre abierto/saqueado deja paso al barrido normal.
+- `dungeon_blocked reason=chest_key_missing`: cuando el cofre está bloqueado y
+  no existe ni portador ni contenedor con `chest_key` (save ya gastado), se
+  emite una vez en vez de girar hasta el timeout. El save sintético
+  `save-dungeon-start` está exactamente en ese estado (silverwolf muerto,
+  llave consumida), y ahora `dungeon.conf` lo verifica.
+
+Pendiente: repetir `newgame` y comprobar que tras la Master Key el barrido
+corre, el nivel se marca `done` y el bot sale por `fnUp` a Yarrow
+(`dungeon_done`) para seguir la ruta a Moon-upon-Thoss.
+
+### Test50 — Post-key contra el botín completo; enemigos inalcanzables
+
+La repetición de `newgame` con la cadena del cofre arreglada confirmó el flujo
+completo de la primera mazmorra: Yarrow (llaves del pueblo, puerta, compras),
+entrada a `firstDungeon-01` (t=54 s), `chest_key` del silverwolf (t=74 s),
+cofre de salida abierto y **Master Key en t=104 s**. Pero el bot murió en
+t=283 s con el nivel a medio barrer (11/16 contenedores), y el registro
+muestra dos causas concretas:
+
+- **La política "post-key" se activaba con la `chest_key`**, no con la Master
+  Key ni con el nivel terminado. Desde t=74 s el bot huía de todo combate
+  (`fleeing ... (post-key)`) en vez de pelear; de espaldas recibió los
+  mordiscos del silverwolf (n=8), gastó las 10 cargas del Lifestone y las 2
+  pociones mayores *antes* de tener la Master Key, y llegó al barrido sin
+  recursos. `tryHeal` además subía a 300 HP entre peleas, otro drenaje.
+  Con la regla de botín completo la política era contradictoria: después de
+  la llave aún quedaba medio nivel por saquear.
+- **Ping-pong contra un enemigo inalcanzable**: un `archaea` (monstruo de
+  agua) a distancia 3-6 absorbía el `combatStep` cada tick; el bot se acercaba
+  hasta donde el pathing llegaba, fallaba, el barrido lo devolvía y repetía
+  durante 50 s junto a contenedores sin abrir. El modelo además cargaba su dps
+  al riesgo del paquete aunque nunca podría morder.
+
+Arreglos:
+
+- `S.exitReady` = Master Key **y** `lvl.done` (nivel barrido). Solo entonces
+  aplican el tope a 300 HP, el gasto sin reserva de Lifestone, el descuento de
+  recursos del modelo y la preferencia por desengancharse. Durante el barrido
+  el bot pelea normalmente y conserva una carga de reserva.
+- Se eliminó el `doFlee` forzado "post-key" con enemigos adyacentes: huir de
+  algo que ya está en rango cuerpo a cuerpo regala golpes. El modelo sigue
+  ofreciendo huida cuando es realmente más segura.
+- `S.unreachable[actor.ID]`: tras un fallo de navegación hacia un enemigo se
+  ignora 30 s (los adyacentes nunca se ignoran). Se limpia al cambiar de
+  mundo y al completar la mazmorra. Esto corta el ping-pong con `archaea`,
+  black slimes y cualquier criatura tras un foso/puerta sellada.
+- `dungeon.conf` exige ahora `level_done@world=firstDungeon-01` (barrido
+  completo del save bloqueado); `newgame.conf` exige `level_done`,
+  `dungeon_done@dungeon=firstDungeon-01`, regreso a Yarrow
+  (`level_enter@from=firstDungeon-01`) y `!death`.
+
+En curso: `tools/regress.sh dungeon newgame` con TIMEOUT 300/900.

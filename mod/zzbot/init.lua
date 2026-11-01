@@ -55,7 +55,8 @@ local S = {
   knownAt = 0,
   lastHealTurn = -1000,
   lastLSTurn = -1000,
-  hasKey = false,
+  exitReady = false,
+  unreachable = {},
   masterKeyLogged = false,
   townIndex = CFG.startTown or 1,
   nextTown = nil,
@@ -72,6 +73,30 @@ local S = {
 local logFile
 local function log(fmt, ...)
   local msg = string.format(fmt, ...)
+  print("[zzbot] " .. msg)
+  if CFG.logpath then
+    logFile = logFile or io.open(CFG.logpath, "a")
+    if logFile then
+      logFile:write(string.format("%s %s\n", os.date("%H:%M:%S"), msg))
+      logFile:flush()
+    end
+  end
+end
+
+-- Machine-parseable event line for tools/check_log.lua. Values are sanitized
+-- so each line stays a flat key=value list that a shell tool can assert on.
+local function ev(kind, fields)
+  local parts = { string.format("EV|t=%.3f|kind=%s", love.timer.getTime() - S.t0, tostring(kind)) }
+  if fields then
+    local keys = {}
+    for k in pairs(fields) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+      local v = tostring(fields[k]):gsub("[^%w%._%-/:%+,]", "_")
+      parts[#parts + 1] = k .. "=" .. v
+    end
+  end
+  local msg = table.concat(parts, "|")
   print("[zzbot] " .. msg)
   if CFG.logpath then
     logFile = logFile or io.open(CFG.logpath, "a")
@@ -193,6 +218,56 @@ local BREAKABLE_OBSTACLES = {
 
 local function isBumpableObstacleName(name)
   return isBumpableDoorName(name) or BREAKABLE_OBSTACLES[name] == true
+end
+
+-- Unopened loot cells: CCellData.cellIsContainer/cellIsChest plus bookshelves,
+-- which are searched by bumping as well. A container is looted when the cell
+-- stops being one of these (chestClosed -> chestOpen, crate -> junk, ...).
+local CONTAINER_CELLS = {
+  sarcophagusClosed = true, weaponRackFull = true, potionShelf = true,
+  armourStandFull = true, crateClosed = true, potClosed = true,
+  barrelClosed = true, chestClosed = true, chestLocked = true,
+  bookshelf = true,
+}
+
+-- Per-world exploration ledger and the loot/stairs helpers that use it.
+-- Dungeon levels persist between transitions, so fog knowledge, looted-
+-- container bookkeeping and the "level done" flag all survive going down and
+-- back up. A level that regenerates (dungeon reset) is detected on re-entry
+-- through a cheap structural fingerprint. Everything is kept under one table
+-- to stay within LuaJIT's per-chunk local limit.
+local Loot = {}
+
+function Loot.rec(world)
+  S.levels = S.levels or {}
+  local rec = S.levels[world]
+  if not rec then
+    rec = { known = {}, knownCount = 0, containers = {}, visited = 0 }
+    S.levels[world] = rec
+  end
+  return rec
+end
+
+-- Walkable and unopened-container counts plus both stair positions: stable
+-- for the lifetime of a level, different after the dungeon generator reruns.
+function Loot.fingerprint(game)
+  local map = game.map
+  local walk, cont = 0, 0
+  for y = 1, map.height do
+    local row = map.cells[y]
+    for x = 1, map.width do
+      local cell = row[x]
+      local data = CCellData and CCellData.cellTypeArray[cell.typeIndex]
+      if data and data.isWalkable then walk = walk + 1 end
+      if CONTAINER_CELLS[cellTypeName(cell)] then cont = cont + 1 end
+    end
+  end
+  local function at(action)
+    local x, y = game.triggerData:findTriggerXYOnLevelWithAction(
+      game.currentWorldName, action)
+    return x and string.format("%d.%d", x, y) or "-"
+  end
+  return string.format("%d:%d:%s:%s", walk, cont, at("fnUp"), at("fnDown"))
 end
 
 local function isPassableForPath(cell)
@@ -508,27 +583,31 @@ local function tryPickLock(game, player, x, y)
 end
 
 -- Remember every cell we have ever seen. Fog of war clears isRemembered as the
--- player looks away, so keeping our own set avoids re-exploring old rooms.
+-- player looks away, so keeping our own set avoids re-exploring old rooms. The
+-- set lives in the per-world ledger so a level we already swept stays known
+-- when the run climbs back through it.
 local function updateKnown(game, player)
   local map = game.map
+  local rec = Loot.rec(game.currentWorldName)
   for y = 1, map.height do
     local row = map.cells[y]
     for x = 1, map.width do
       if row[x].isVisible then
         local k = ckey(x - 1, y - 1)
-        if not S.known[k] then
-          S.known[k] = true
-          S.knownCount = S.knownCount + 1
+        if not rec.known[k] then
+          rec.known[k] = true
+          rec.knownCount = rec.knownCount + 1
         end
       end
     end
   end
-  S.knownPX, S.knownPY = playerPos(player)
-  S.knownAt = now()
+  rec.knownPX, rec.knownPY = playerPos(player)
+  rec.knownAt = now()
 end
 
 local function isKnown(x, y)
-  return S.known[ckey(x, y)] == true
+  local rec = S.levels and S.world and S.levels[S.world]
+  return rec ~= nil and rec.known[ckey(x, y)] == true
 end
 
 -- Nearest known walkable cell that borders something we have never seen.
@@ -1219,7 +1298,7 @@ local function tryHeal(game, player)
   local wand = findLifestone(player)
   local charges = lsUses(wand)
   local nPot, bestPot = potionInfo(player)
-  local reserve = S.hasKey and 0 or CC.LS_RESERVE
+  local reserve = S.exitReady and 0 or CC.LS_RESERVE
   local lsReady = charges > 0
     and ((gGameTurn or 0) - (S.lastLSTurn or -1000)) >= CC.LS_CD
 
@@ -1255,9 +1334,11 @@ local function tryHeal(game, player)
   end
 
   if not emergency then
-    -- After the key the mission is to leave alive: top up to 300 before
-    -- moving toward the next objective.
-    if S.hasKey and #adj == 0 and hp < CC.POSTKEY_HP then
+    -- With the exit unlocked and the floor swept the mission is to leave
+    -- alive: top up to 300 before moving toward the stairs. Before that
+    -- point the run still has looting and fighting ahead, so charges stay
+    -- reserved for emergencies.
+    if S.exitReady and #adj == 0 and hp < CC.POSTKEY_HP then
       if lsReady and charges > 0 then return useLS(game, player, wand, "post-key") end
       if nPot > 0 and missing >= 150 then return drinkPotion(game, player) end
       return false
@@ -1348,7 +1429,7 @@ local function combatDiag(game, player, prof, threats)
   local nPot = potionInfo(player)
   local wand = findLifestone(player)
   local lsCharges = lsUses(wand)
-  local reserve = S.hasKey and 0 or CC.LS_RESERVE
+  local reserve = S.exitReady and 0 or CC.LS_RESERVE
   local v, need, res = "none", 0, 0
   if #near > 0 then
     local deadEnd = passableNeighbourCount(game, player.position.x, player.position.y) <= 1
@@ -1544,8 +1625,8 @@ end
 
 -- A charge is worth more when no key has been found yet: the remaining
 -- incursion still contains the fight for the chest key and the walk out.
-local function resourceValue(hasKey)
-  return hasKey and 0.4 or 1.0
+local function resourceValue(exitReady)
+  return exitReady and 0.4 or 1.0
 end
 
 local function poiseWaitTime(game, player)
@@ -1565,7 +1646,7 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
   local hp = player.health
   local maxhp = player.maxHealth
   local missing = math.max(0, maxhp - hp)
-  local val = resourceValue(S.hasKey)
+  local val = resourceValue(S.exitReady)
 
   for _, w in ipairs(adj) do
     actions[#actions + 1] = {
@@ -1672,13 +1753,13 @@ local function betterEval(a, b)
   return (a.meanDuration or 0) < (b.meanDuration or 0)
 end
 
-local function chooseEval(evals, hasKey, emergency)
+local function chooseEval(evals, exitReady, emergency)
   if #evals == 0 then return nil, "no evaluation" end
   table.sort(evals, betterEval)
   local best = evals[1]
-  -- After the key, surfacing alive matters more than finishing another fight.
+  -- Heading out, surfacing alive matters more than finishing another fight.
   -- Only override when the escape itself is within the risk budget.
-  if hasKey and not emergency and best.action.kind ~= "flee" then
+  if exitReady and not emergency and best.action.kind ~= "flee" then
     for _, e in ipairs(evals) do
       if e.action.kind == "flee" and (e.pDeathUpper or 1) <= CFG.alpha * 1.5 then
         return e, "post-key disengage"
@@ -1751,7 +1832,7 @@ local function modelChoose(game, player, prof, adj, near, deadEnd, nPot, bestPot
     S.modelErrors = (S.modelErrors or 0) + 1
     return nil
   end
-  local chosen, reason = chooseEval(evals, S.hasKey, emergency)
+  local chosen, reason = chooseEval(evals, S.exitReady, emergency)
   return chosen, evals, reason
 end
 
@@ -1812,6 +1893,21 @@ end
 local function combatStep(game, player)
   local prof = playerProfile(game, player)
   local threats = threatList(game, player, prof)
+  -- A creature in water, across a chasm or behind sealed terrain can be
+  -- visible and even shoot, but no amount of navigation reaches it with a
+  -- melee swing. Chasing one burns turns while the loot sweep waits, so after
+  -- a failed approach it is ignored for a while and retried later.
+  for i = #threats, 1, -1 do
+    local w = threats[i]
+    local untilT = S.unreachable[w.actor.ID]
+    if untilT then
+      if untilT > now() and w.dist > 1 then
+        table.remove(threats, i)
+      elseif untilT <= now() then
+        S.unreachable[w.actor.ID] = nil
+      end
+    end
+  end
   if #threats == 0 then
     S.retreatTarget = nil
     S.holdSinceTurn = nil
@@ -1868,10 +1964,10 @@ local function combatStep(game, player)
   local nPot, bestPot = potionInfo(player)
   local wand = findLifestone(player)
   local charges = lsUses(wand)
-  local reserve = S.hasKey and 0 or CC.LS_RESERVE
+  local reserve = S.exitReady and 0 or CC.LS_RESERVE
   local v = verdict(near, player.health + poise, nPot,
     math.max(0, charges - reserve), prof, deadEnd)
-  local fleeWanted = S.hasKey or v == "avoid"
+  local fleeWanted = S.exitReady or v == "avoid"
     or player.health <= math.floor(player.maxHealth * 0.3)
   -- The model's action set prices contact decisions (hit, heal, flee, wait,
   -- choke); approach and avoidance at range belong to the movement layer
@@ -1905,16 +2001,15 @@ local function combatStep(game, player)
     if tryHeal(game, player) then return true end
   end
 
-  -- 3. Post-key: do not get dragged into another fight. tryHeal has already
-  -- topped us back to 300; break contact and keep moving to the objective.
-  if S.hasKey then
+  -- 3. Heading out: do not get dragged into another fight, but never turn
+  -- our back on something already in melee range -- that hands it free
+  -- swings. With nothing adjacent, hand the turn to movement. The models
+  -- above already offered a flee when it is genuinely safer.
+  if S.exitReady then
     S.retreatTarget = nil
     if #adj == 0 then
       S.holdSinceTurn = nil
       return false
-    end
-    if allOut then
-      if doFlee(game, player, nil, "post-key") then return true end
     end
   end
 
@@ -2049,6 +2144,10 @@ local function combatStep(game, player)
       log("combat: %s at %d,%d dist=%s unreachable from %d,%d",
         tostring(target.actorType), ex, ey, tostring(target.dist), px, py)
     end
+    if not S.unreachable[target.actor.ID] then
+      S.unreachable[target.actor.ID] = now() + 30
+      log("combat: ignoring unreachable %s for 30s", tostring(target.actorType))
+    end
   end
   return false
 end
@@ -2089,8 +2188,9 @@ end
 -- Each god pays +2 devotion the first time the player enters its home town.
 -- That is the only steady source of devotion before Relic Dungeons, and the
 -- stat Gifts it buys are the difference against the Keep's constructs. The
--- tour visits every god town once, filtered against the achievements stored in
--- the save, so a restart never repeats a paid visit.
+-- visit list is filtered against the achievements stored in the save so a
+-- restart never repeats a paid visit; it only gates dedication and logging,
+-- it never reorders the campaign or delays a dungeon.
 local TOUR_TOWNS = {
   { town = "Barrow-Linn",   ach = "homeTown3" },  -- lordsOfDust
   { town = "Harrowdus",     ach = "homeTown2" },  -- deathsHarlequin
@@ -2411,30 +2511,32 @@ local function overworldTravelStep(game, player, target)
   return false
 end
 
-local function approachCell(game, player, tx, ty)
+-- Steps to an orthogonal walkable neighbour of (tx, ty); empty when already
+-- adjacent. Used for bumping doors, containers and other non-walkable cells.
+function Loot.plan(game, player, tx, ty)
   local px, py = playerPos(player)
-  local dx, dy = tx - px, ty - py
-  if math.abs(dx) + math.abs(dy) == 1 then
-    pressDelta(dx, dy)
-    return true
-  end
-
+  if math.abs(tx - px) + math.abs(ty - py) == 1 then return {} end
   local map = game.map
   local best
   for _, d in ipairs(tools.aroundNESW) do
     local nx, ny = tx + d[1], ty + d[2]
     if inBounds(map, nx, ny) and cellWalkable(cellAt(map, nx, ny)) then
       local steps = travelSteps(game, player, nx, ny)
-      if steps and steps[1] and (best == nil or #steps < #best) then
-        best = steps
-      end
+      if steps and (best == nil or #steps < #best) then best = steps end
     end
   end
-  if best then
-    pressDelta(best[1].x, best[1].y)
-    return true
+  return best
+end
+
+local function approachCell(game, player, tx, ty)
+  local steps = Loot.plan(game, player, tx, ty)
+  if not steps then return false end
+  if #steps == 0 then
+    pressDelta(tx - player.position.x, ty - player.position.y)
+  else
+    pressDelta(steps[1].x, steps[1].y)
   end
-  return false
+  return true
 end
 
 -- Locked doors carry their requirement in a locked_door trigger: string data
@@ -2696,6 +2798,171 @@ local function doorObjectiveStep(game, player)
   return false
 end
 
+-- Container sweep. A dungeon level is not finished while any reachable
+-- container on it is still closed, so every closed chest/crate/barrel/pot/
+-- sarcophagus/rack/shelf/bookshelf goes into the per-level ledger and the
+-- nearest reachable one is bumped open before exploration continues. Keys
+-- (chest_key) can hide inside them, so this is not optional.
+function Loot.scan(game)
+  local name = game.currentWorldName
+  local rec = Loot.rec(name)
+  local map = game.map
+  for y = 1, map.height do
+    local row = map.cells[y]
+    for x = 1, map.width do
+      local nm = cellTypeName(row[x])
+      if nm and CONTAINER_CELLS[nm] then
+        local mx, my = x - 1, y - 1
+        local k = ckey(mx, my)
+        local c = rec.containers[k]
+        if not c then
+          c = { x = mx, y = my, cell = nm, state = "pending" }
+          rec.containers[k] = c
+          ev("container_seen", { world = name, x = mx, y = my, cell = nm })
+        elseif c.state == "pending" then
+          c.cell = nm
+        end
+      end
+    end
+  end
+  rec.scanAt = now()
+end
+
+-- True when the next movement step walks into a locked door. Those need a
+-- pick, a plate/key unlock or the master key, so the sweep and the frontier
+-- hand over to the door logic instead of bumping them blindly.
+function Loot.lockedAhead(game, px, py, steps)
+  local s = steps and steps[1]
+  if not s then return false end
+  local nm = cellTypeName(cellAt(game.map, px + s.x, py + s.y))
+  return LOCKED_DOOR_NAMES[nm] == true
+end
+
+function Loot.sweepStep(game, player)
+  local name = game.currentWorldName
+  local rec = Loot.rec(name)
+  if now() - (rec.scanAt or 0) > 1 then Loot.scan(game) end
+  local hasLockpick = hasItem(player, "lockpick")
+  local best, bestLen = nil, math.huge
+  for _, c in pairs(rec.containers) do
+    if c.state == "pending" then
+      local nm = cellTypeName(cellAt(game.map, c.x, c.y))
+      if not nm or not CONTAINER_CELLS[nm] then
+        c.state = "done"
+        c.problem = nil
+        ev("container_open", { world = name, x = c.x, y = c.y, was = c.cell, now = nm })
+        log("loot: container at %d,%d opened (%s -> %s)", c.x, c.y,
+          tostring(c.cell), tostring(nm))
+      else
+        c.cell = nm
+        local locked = nm == "chestLocked"
+          and not hasItem(player, "chest_key")
+          and not hasItem(player, "key_master")
+          and not hasLockpick
+        if locked then
+          if c.problem ~= "locked" then
+            c.problem = "locked"
+            ev("container_skip", {
+              world = name, x = c.x, y = c.y, cell = nm, reason = "locked_no_key",
+            })
+            log("loot: locked chest at %d,%d waits for a key", c.x, c.y)
+          end
+        else
+          local steps = Loot.plan(game, player, c.x, c.y)
+          if steps then
+            c.problem, c.noPathSince = nil, nil
+            if #steps < bestLen then
+              best, bestLen = { c = c, steps = steps }, #steps
+            end
+          elseif c.noPathSince and now() - c.noPathSince > 20 then
+            if c.problem ~= "unreachable" then
+              c.problem = "unreachable"
+              ev("container_skip", {
+                world = name, x = c.x, y = c.y, cell = nm, reason = "unreachable",
+              })
+            end
+          else
+            c.noPathSince = c.noPathSince or now()
+          end
+        end
+      end
+    end
+  end
+  if not best then return false end
+  if bestLen > 0
+    and Loot.lockedAhead(game, player.position.x, player.position.y, best.steps) then
+    return false
+  end
+  S.phase = "loot"
+  S.stuckSince = nil
+  if bestLen == 0 then
+    local nm = cellTypeName(cellAt(game.map, best.c.x, best.c.y))
+    if nm == "chestLocked" and not hasItem(player, "chest_key")
+      and not hasItem(player, "key_master")
+      and tryPickLock(game, player, best.c.x, best.c.y) then
+      return true
+    end
+    pressDelta(best.c.x - player.position.x, best.c.y - player.position.y)
+  else
+    pressDelta(best.steps[1].x, best.steps[1].y)
+  end
+  return true
+end
+
+-- Walk to the fnUp/fnDown stairs trigger and use it. Stairs carry the
+-- destination world in their trigger, so the game itself handles the level
+-- change once Return is pressed on the cell.
+function Loot.stairsStep(game, player, action, phase)
+  local sx, sy = game.triggerData:findTriggerXYOnLevelWithAction(
+    game.currentWorldName, action)
+  if not sx then return false end
+  local px, py = playerPos(player)
+  if px == sx and py == sy then
+    pressKey("return")
+    S.phase = phase
+    return true
+  end
+  if navigateOrOpenDoor(game, player, sx, sy) ~= "nopath" then
+    S.phase = phase
+    return true
+  end
+  return false
+end
+
+-- Deeper world named by this level's fnDown trigger, if there is one.
+function Loot.deeperWorld(game)
+  local list = game.triggerData:getAllTriggersOnLevelWithActionName(
+    game.currentWorldName, "fnDown")
+  local t = list and list[1]
+  if t and type(t.data) == "string" and t.data ~= "" then return t.data end
+end
+
+-- After the sweep the relic guardian (or a key carrier) may still stand
+-- between the bot and the exit. Chase the nearest hostile, visible or not:
+-- the boss level has no stairs down, and the key only drops when it dies.
+function Loot.huntStep(game, player)
+  local best, bestD
+  for _, a in ipairs(game.actorManager.actorArray) do
+    if a.ID ~= player.ID and not a.isCorpse and a.fallingTime == 0
+      and a.isAway ~= true and a:isKillable() and player:isEnemy(a) then
+      local d = math.max(math.abs(a.position.x - player.position.x),
+        math.abs(a.position.y - player.position.y))
+      if bestD == nil or d < bestD then best, bestD = a, d end
+    end
+  end
+  if not best then return false end
+  if S.huntTarget ~= best.actorType then
+    S.huntTarget = best.actorType
+    log("hunt: chasing %s at %d,%d (dist %d)",
+      tostring(best.actorType), best.position.x, best.position.y, bestD)
+  end
+  if moveToActor(game, player, best) then
+    S.phase = "hunt"
+    return true
+  end
+  return false
+end
+
 local function findActionTrigger(game, action, data)
   local list = game.triggerData:getAllTriggersOnLevelWithActionName(
     game.currentWorldName, action) or {}
@@ -2852,6 +3119,50 @@ local function innRestStep(game, player)
     log("resting at inn (hp %d/%d)", player.health, player.maxHealth)
   else
     pressDelta(best[1].x, best[1].y)
+  end
+  return true
+end
+
+-- Bumping a villager while pathing leaves a grievance that blocks sleeping and
+-- force-zooming out of town until it is paid. Clearing it through the game's
+-- own pay dialog (the multi choice box with "Pay" first) is the only way out;
+-- log a stuck event when the purse cannot cover it.
+local function grievanceStep(game, player)
+  local total = 0
+  pcall(function() total = game.actorManager:getTotalGrievances() or 0 end)
+  if total <= 0 then return false end
+  local actor
+  for _, a in ipairs(game.actorManager.actorArray) do
+    if not a.isPlayer and not a.isCorpse and a.faction == "player"
+      and (a.grievance or 0) > 0 then
+      if not actor or a.grievance > actor.grievance then actor = a end
+    end
+  end
+  if not actor then return false end
+  local cost = actor.grievance
+  if not game:canAfford(cost) then
+    if now() - (S.grievanceT or 0) > 10 then
+      S.grievanceT = now()
+      local money = 0
+      pcall(function() money = game:getPlayerStats().money or 0 end)
+      log("grievance: %s wants %dG, money is %d; cannot leave %s yet",
+        tostring(actor.actorType), cost, money,
+        tostring(game.currentWorldName))
+      ev("stuck", {
+        world = game.currentWorldName, x = player.position.x, y = player.position.y,
+        source = "grievance-poor", cost = cost, money = money,
+      })
+    end
+    return false
+  end
+  if now() - (S.grievanceT or 0) > 2 then
+    S.grievanceT = now()
+    log("grievance: paying %dG to %s", cost, tostring(actor.actorType))
+    ev("grievance", {
+      world = game.currentWorldName, cost = cost, actor = actor.actorType,
+    })
+    local ok, err = pcall(game.openPayGrievance, game, actor)
+    if not ok then log("grievance: openPayGrievance failed: %s", tostring(err)) end
   end
   return true
 end
@@ -3635,7 +3946,187 @@ local function discoveryStep(game, player)
 end
 
 
+-- P0 watchdog: detect a dialog or a world that stopped making progress, then
+-- escalate from ordinary key presses to closing the box through its own API.
+-- It is deliberately slow (seconds, not ticks) so ordinary alerts and tutorial
+-- pages are never cut short. A dialog that closes and reopens with the same
+-- text at the same spot is not progress: its timer survives short gaps, which
+-- is how the "grievance" alert freeze shows up (bot presses Return on the exit
+-- every tick, the alert closes and is immediately re-triggered).
+local WD = {
+  sig = nil, since = 0, lastLog = 0,
+  dialogKey = nil, dialogAt = 0, dialogStage = 0, gapAt = nil,
+}
+
+local function openDialog(game)
+  local b = game.alertBox
+  if b and b.isOpen then return "alert", b end
+  b = game.confirmBox
+  if b and b.isOpen then return "confirm", b end
+  b = game.tutorialBox
+  if b and b.isOpen then return "tutorial", b end
+  b = game.speechArea
+  if b and b.isOpen then return "speech", b end
+  b = game.multiChoiceBox
+  if b and b.isOpen then return "multi", b end
+end
+
+local function dialogText(box)
+  return tostring(box.bodyText or box.title or box.currentText or box.text or "")
+end
+
+local function dialogSignature(game, player, name, box)
+  local sig = table.concat({
+    tostring(game.currentWorldName),
+    tostring(player.position.x), tostring(player.position.y),
+    name, dialogText(box),
+  }, "|")
+  if name == "confirm" then
+    sig = sig .. "|" .. tostring(box.yesText) .. "|" .. tostring(box.noText)
+  elseif name == "multi" then
+    sig = sig .. "|" .. tostring(box.cursorPosition) .. "|" .. tostring(box.isLastChoiceClose)
+  end
+  return sig
+end
+
+local function watchdog(game, player)
+  local t = now()
+  local name, box = openDialog(game)
+
+  if name then
+    WD.gapAt = nil
+    local sig = dialogSignature(game, player, name, box)
+    if sig ~= WD.dialogKey then
+      WD.dialogKey, WD.dialogAt, WD.dialogStage = sig, t, 0
+    end
+    local idle = t - WD.dialogAt
+    if idle < 6 then return false end
+
+    local stage = math.min(4, 1 + math.floor((idle - 6) / 4))
+    if stage <= WD.dialogStage then return false end
+    WD.dialogStage = stage
+    local text = dialogText(box)
+    local fields = {
+      world = game.currentWorldName, x = player.position.x, y = player.position.y,
+      source = name, stage = stage, idle = math.floor(idle), text = text:sub(1, 120),
+    }
+    if name == "alert" then
+      fields.fraction = string.format("%.2f", box.fraction or -1)
+      fields.delay = string.format("%.2f", box.delayTime or -1)
+      fields.boxes = #(box.boxArray or {})
+    end
+    log("watchdog: %s open for %.0fs (stage %d) '%s'", name, idle, stage, text:sub(1, 160))
+    ev(name == "alert" and "alert_stuck" or "stuck", fields)
+
+    if stage == 1 then
+      if name == "confirm" then box.confirm = false end
+      pressKey("return")
+    elseif stage == 2 then
+      pressKey("space")
+    elseif stage == 3 then
+      pressKey("escape")
+    else
+      local ok, err = pcall(function()
+        if name == "alert" then
+          box:close()
+        elseif name == "confirm" then
+          box.confirm = false
+          box:setInactive()
+        elseif name == "multi" then
+          box:setInactive()
+        elseif name == "speech" then
+          box:close()
+        elseif name == "tutorial" then
+          box:setInactive()
+        end
+      end)
+      log("watchdog: force-closed %s (%s)", name, ok and "ok" or tostring(err))
+      ev("stuck", {
+        world = game.currentWorldName, x = player.position.x, y = player.position.y,
+        source = name .. "_force_close", idle = math.floor(idle),
+      })
+    end
+    return true
+  end
+
+  -- Give a closed dialog two seconds to reopen with the same signature before
+  -- forgetting it, so a close/reopen loop keeps accumulating idle time.
+  if WD.dialogKey then
+    WD.gapAt = WD.gapAt or t
+    if t - WD.gapAt > 2 then
+      WD.dialogKey, WD.dialogAt, WD.dialogStage, WD.gapAt = nil, t, 0, nil
+    end
+  end
+
+  local ps = game:getPlayerStats()
+  local sig = table.concat({
+    tostring(game.currentWorldName),
+    tostring(player.position.x), tostring(player.position.y),
+    tostring(gGameTurn), tostring(player.health),
+    tostring(ps and ps.money), tostring(#(player.inventory or {})),
+  }, "|")
+  if sig ~= WD.sig then
+    WD.sig, WD.since = sig, t
+    return false
+  end
+  local idle = t - WD.since
+  if idle > 20 and t - WD.lastLog > 10 then
+    WD.lastLog = t
+    log("watchdog: no progress for %.0fs at %s %d,%d phase=%s",
+      idle, tostring(game.currentWorldName), player.position.x, player.position.y,
+      tostring(S.phase))
+    ev("stuck", {
+      world = game.currentWorldName, x = player.position.x, y = player.position.y,
+      source = "no-progress", idle = math.floor(idle), phase = S.phase,
+    })
+  end
+  return false
+end
+
+-- Confirm boxes carry meaning in their text. The old handler accepted every
+-- prompt, which approved theft, donations and irreversible trapdoors alike.
+local function classifyConfirm(text)
+  local t = text:lower()
+  local function has(s) return t:find(s, 1, true) ~= nil end
+  if has("do you want to steal") then return "theft" end
+  if has("leave this area") then return "zoom_leave" end
+  if has("forsake your old god") then return "apostasy" end
+  if has("dedicate yourself") then return "dedicate" end
+  if has("tether dungeon") then return "dungeon_tether" end
+  if has("leads to your doom") then return "dungeon_doom" end
+  if has("relic dungeon") or has("relic guardian") then return "dungeon_relic" end
+  if has("the egg") or has("100 floors") or has("final challenge") then
+    return "dungeon_endless"
+  end
+  if has("this is a dungeon") or has("master key") then return "dungeon_mini" end
+  if has("one-way trip") or has("proceed onward") then return "dungeon_arena" end
+  if has("are you sure you wish to enter") then return "dungeon_entry" end
+  if has("return to the surface") or has("title screen") then return "leave" end
+  if has("quit the game") then return "quit" end
+  if has("delete your save") then return "delete" end
+  if has("leap into the void") then return "void" end
+  if has("sacrifice all") or has("pray to") then return "sin" end
+  if has("donation box") then return "donate" end
+  if has("discard") then return "discard" end
+  if has("repair") then return "repair" end
+  return "unknown"
+end
+
+-- Entry prompts are accepted only when the campaign walked us here: a town's
+-- lead sent us to this dungeon, or a descent is already in progress. Anything
+-- else (a trapdoor found while exploring, an unknown prompt) declines.
+local function confirmDecision(class, game)
+  if class == "zoom_leave" or class == "dedicate" then return true end
+  if class:sub(1, 8) == "dungeon_" then
+    return S.phase == "to-dungeon" or S.entered == true
+  end
+  return false
+end
+
 local function handleDialogs(game)
+  if not (game.confirmBox and game.confirmBox.isOpen) then
+    S.confirmSeen = nil
+  end
   if S.tearPending and game.multiChoiceBox and game.multiChoiceBox.isOpen then
     S.tearPending = false
     local ok, err = pcall(game.finishShattering, game, godIndex(CFG.god), "", S.tearID)
@@ -3660,7 +4151,24 @@ local function handleDialogs(game)
     return true
   end
   if game.confirmBox and game.confirmBox.isOpen then
-    game.confirmBox.confirm = true
+    local cb = game.confirmBox
+    local text = tostring(cb.bodyText or "")
+    local class = classifyConfirm(text)
+    local accept = confirmDecision(class, game)
+    if S.confirmSeen ~= text then
+      S.confirmSeen = text
+      local flat = text:gsub("%s+", " ")
+      log("confirm [%s] %s: '%s'", class, accept and "accept" or "decline",
+        flat:sub(1, 160))
+      ev("confirm", {
+        class = class, decision = accept and "accept" or "decline",
+        world = game.currentWorldName, phase = S.phase, text = flat,
+      })
+      if class == "unknown" then
+        ev("confirm_unknown", {phase = S.phase, text = flat})
+      end
+    end
+    cb.confirm = accept
     pressKey("return")
     return true
   end
@@ -3716,7 +4224,7 @@ local function dumpMap(game, tag)
   f:write(string.format("== %s %s %s player=%d,%d turn=%s hp=%d/%d known=%d\n",
     os.date("%H:%M:%S"), tag, tostring(game.currentWorldName),
     player.position.x, player.position.y, tostring(gGameTurn),
-    player.health, player.maxHealth, S.knownCount))
+    player.health, player.maxHealth, Loot.rec(game.currentWorldName).knownCount))
   for y = 0, map.height - 1 do
     local row = {}
     for x = 0, map.width - 1 do
@@ -3746,6 +4254,7 @@ local function campaignComplete(reason)
   S.finished = true
   S.done = true
   log("CAMPAIGN COMPLETE: %s", reason)
+  ev("campaign_done", {reason = reason, town = S.world})
   if not CFG.quit then
     S.active = false
   end
@@ -3758,19 +4267,21 @@ local function markDungeonComplete(game, dungeonName)
   if not dungeonName then return end
   S.dungeonDone[dungeonName] = true
   S.entered = false
-  S.hasKey = false
+  S.exitReady = false
+  S.unreachable = {}
   S.masterKeyLogged = false
   S.modelFleeTurn = nil
   local wd = game:getWorldDataWithName(dungeonName)
   local entrance = wd and wd.entrance
   log("DUNGEON COMPLETE: %s (entrance %s)", tostring(dungeonName), tostring(entrance))
+  ev("dungeon_done", {dungeon = dungeonName, entrance = tostring(entrance)})
   local idx = entrance and townIndex(entrance) or S.townIndex
   S.townIndex = math.max(S.townIndex or 1, (idx or 1) + 1)
   if S.townIndex > #TOWN_ORDER then
     campaignComplete("every town visited")
   else
-    local pending = tourPending(game)
-    S.nextTown = (pending and pending[1]) or TOWN_ORDER[S.townIndex]
+    tourPending(game)
+    S.nextTown = TOWN_ORDER[S.townIndex]
     log("CAMPAIGN: next target %s", S.nextTown)
   end
 end
@@ -3781,17 +4292,35 @@ local function tickWorld(game, player)
 
   if name ~= S.world then
     S.world = name
-    S.known = {}
-    S.knownCount = 0
-    S.knownPX, S.knownPY = nil, nil
+    local rec = Loot.rec(name)
+    local fp = Loot.fingerprint(game)
+    if data and data.dungeonType then
+      if rec.fp and rec.fp ~= fp then
+        rec.known, rec.knownCount = {}, 0
+        rec.containers = {}
+        rec.done = nil
+        log("level %s regenerated (was %s now %s)", tostring(name), rec.fp, fp)
+        ev("level_reset", { world = name, was = rec.fp, now = fp })
+      end
+      rec.fp = fp
+      rec.visited = (rec.visited or 0) + 1
+      rec.scanAt = 0
+    end
     S.zoomExit = nil
+    S.unreachable = {}
     S.sellActive, S.sellRole = nil, nil
     S.buyActive, S.buyRole = nil, nil
     S.discActive, S.discRole = nil, nil
     S.worldChanges = (S.worldChanges or 0) + 1
     overRoute.path, overRoute.failTarget, overRoute.failWorld = nil, nil, nil
     ferryRoute.goal, ferryRoute.path, ferryRoute.failed = nil, nil, false
-    log("world changed: %s", tostring(name))
+    log("world changed: %s (visit %s)", tostring(name), tostring(rec.visited))
+    ev("level_enter", {
+      world = name, x = player.position.x, y = player.position.y,
+      from = S.lastWorld, dungeon = data and data.dungeonType or "",
+      visited = rec.visited, done = rec.done and 1 or 0,
+    })
+    S.lastWorld = name
     dumpMap(game, "enter")
   end
 
@@ -3828,8 +4357,9 @@ local function tickWorld(game, player)
       tostring(player.poise), tostring(player.maxPoise))
   end
 
-  if player.position.x ~= S.knownPX or player.position.y ~= S.knownPY
-    or now() - S.knownAt > 2 then
+  local curRec = Loot.rec(name)
+  if player.position.x ~= curRec.knownPX or player.position.y ~= curRec.knownPY
+    or now() - (curRec.knownAt or 0) > 2 then
     updateKnown(game, player)
   end
 
@@ -3866,12 +4396,17 @@ local function tickWorld(game, player)
   -- the Overworld exit trigger and continue on the next world.
   if data and data.isTown then
     local px, py = playerPos(player)
-    local tourActive = tourPending(game) ~= nil
+    local routeTown = TOWN_ORDER[S.townIndex or 1]
+    tourPending(game)
     if S.nextTown == name then
       S.nextTown = nil
       log("CAMPAIGN: arrived in %s", name)
-      if tourRemove(name) then tourActive = true end
+      tourRemove(name)
     end
+
+    -- A grievance from an accidental bump blocks the exit and the inn; pay it
+    -- before anything else spends money.
+    if grievanceStep(game, player) then return end
 
     -- Boons first: offerings, Gifts and dedication only happen in safe towns.
     if godStep(game, player) then return end
@@ -3919,17 +4454,18 @@ local function tickWorld(game, player)
       end
     end
 
-    -- Tour stops are transit-only: visit the god's home for the Devotional
-    -- Task, rest if hurt, and move on without touching the dungeon here.
-    if tourActive then
-      if innRestStep(game, player) then
-        S.phase = "tour-inn"
-        return
-      end
+    -- Heal at the inn before the road or the dungeon; resting is only done
+    -- when hurt, so a healthy bot walks straight on.
+    if innRestStep(game, player) then
+      S.phase = "inn-rest"
+      return
     end
 
+    -- The town's own dungeon always comes first: the route only moves on
+    -- once the dungeon named in leadsTo is done. Tour visits are recorded
+    -- above but never delay a dungeon.
     local target = data.leadsTo
-    local delve = target and not S.dungeonDone[target] and not tourActive
+    local delve = target and not S.dungeonDone[target] and name == routeTown
 
     if delve and target == "firstDungeon-01" then
       local chestKey = hasItem(player, "farm_chest_key")
@@ -4011,24 +4547,20 @@ local function tickWorld(game, player)
       return
     end
 
-    -- Nothing left to delve here: advance the route and step onto the town exit.
-    if tourActive then
-      S.phase = "tour-town"
-    else
-      -- The ferry dock is not a campaign town; passing through it must not
-      -- advance the route past the next real town.
-      local idx = townIndex(name)
-      if idx and (S.townIndex or 1) <= idx then
-        S.townIndex = idx + 1
-        if S.townIndex > #TOWN_ORDER then
-          campaignComplete("visited every town")
-          return
-        end
-        S.nextTown = TOWN_ORDER[S.townIndex]
-        log("CAMPAIGN: leaving %s, next target %s", name, S.nextTown)
+    -- Nothing left to delve here: advance the route and step onto the town
+    -- exit. Only the current route town advances it; passing through some
+    -- other town must not skip the dungeons on the way.
+    local idx = townIndex(name)
+    if idx and (S.townIndex or 1) == idx then
+      S.townIndex = idx + 1
+      if S.townIndex > #TOWN_ORDER then
+        campaignComplete("visited every town")
+        return
       end
-      S.phase = "leave-town"
+      S.nextTown = TOWN_ORDER[S.townIndex]
+      log("CAMPAIGN: leaving %s, next target %s", name, S.nextTown)
     end
+    S.phase = "leave-town"
     local ex, ey = game.triggerData:findTriggerXYOnLevelWithActionAndData(
       name, "playerStart", "Overworld")
     if not ex then
@@ -4060,8 +4592,8 @@ local function tickWorld(game, player)
   -- it makes the game zoom into the town by itself.
   if data and data.isOverworld then
     if not S.nextTown then
-      local pending = tourPending(game)
-      S.nextTown = (pending and pending[1]) or TOWN_ORDER[S.townIndex or 1]
+      tourPending(game)
+      S.nextTown = TOWN_ORDER[S.townIndex or 1]
       log("CAMPAIGN: resuming route at %s", tostring(S.nextTown))
     end
     -- Overworld "enemies" are only markers: contact turns into a Zoom battle
@@ -4088,8 +4620,6 @@ local function tickWorld(game, player)
   end
   -- The dangerous milestone is the chest key: it is carried by the pack that
   -- can kill us, and after taking it the plan is to break contact alive.
-  S.hasKey = hasMasterKey or hasChestKey
-
   -- With no potion and no Lifestone charge left, health cannot be recovered
   -- this run: route around danger instead of walking into it.
   local noRecovery = lsUses(findLifestone(player)) == 0
@@ -4097,57 +4627,31 @@ local function tickWorld(game, player)
   S.avoidDanger = (noRecovery and player.health <= math.floor(player.maxHealth * 0.35))
     and hostileDangerCells(game, player, 3) or nil
 
-  if hasMasterKey then
-    S.phase = "to-exit"
-    if nearestVisibleEnemy(game, player, 3) and combatStep(game, player) then
-      return
-    end
-    -- The key opens the way out but does not finish the run: sweep the rest
-    -- of the level first so loot and unexplored rooms are not left behind.
-    -- Only while there is healing left to survive the detour; a wounded run
-    -- with no potions and no Lifestone charge goes straight for the exit.
-    local canSweep = player.health > player.maxHealth * 0.6
-      and (potionInfo(player) > 0 or lsUses(findLifestone(player)) > 0)
-    if canSweep then
-      local fx, fy, steps = findFrontier(game, player)
-      if fx and steps and steps[1] then
-        S.phase = "exit-explore"
-        pressDelta(steps[1].x, steps[1].y)
-        return
-      end
-    end
-    local ex, ey = dungeonExitXY(game)
-    if ex then
-      if px == ex and py == ey then
-        pressKey("return")
-      else
-        navigateOrOpenDoor(game, player, ex, ey)
-      end
-      return
-    end
-    log("master key found but no exit stairs trigger")
-    return
-  end
-
-  -- Resolve contact first (grace blow, emergency heal, kite, flee, fight).
-  -- Healing out of contact only happens once the fight decision is settled.
+  -- Contact first: grace blow, emergency heal, kite, flee or fight. Any
+  -- outstanding fight is settled before loot or stairs are considered.
   if combatStep(game, player) then return end
   if tryHeal(game, player) then return end
 
-  local cx, cy = keyChestXY(game)
-  local chestUnlocked = false
-  if cx then
-    -- The exit chest only needs the chest key while it is still chestLocked.
-    -- If we already unlocked it (key consumed) bump it again to loot it.
-    chestUnlocked = cellTypeName(cellAt(game.map, cx, cy)) ~= "chestLocked"
+  -- The exit chest of a non-relic dungeon yields the dungeon prize plus the
+  -- Master Key. It opens with the chest key (a miniboss carries it, or it is
+  -- hidden in a container), so finding that key comes first. Once the master
+  -- key is held the chest has done its job: targeting it again makes the bot
+  -- bump an already-looted cell forever and starves the loot sweep.
+  local cx, cy
+  local chestCell
+  if not hasMasterKey then
+    cx, cy = keyChestXY(game)
+    if cx then chestCell = cellTypeName(cellAt(game.map, cx, cy)) end
   end
+  local chestUnlocked = chestCell ~= nil and chestCell ~= "chestLocked"
+  local chestWorkable = chestCell == "chestLocked" or chestCell == "chestClosed"
 
-  if cx and (hasChestKey or chestUnlocked) then
+  if cx and chestWorkable and (hasChestKey or chestUnlocked) then
     S.phase = "to-key"
     if approachOrOpenDoor(game, player, cx, cy) then return end
   end
 
-  if cx and not hasChestKey and not chestUnlocked then
+  if cx and chestCell == "chestLocked" and not hasChestKey then
     -- Find the chest key first: a miniboss/key goblin carries it, or it sits
     -- inside a non-chest container somewhere on the level.
     local moved, carrier = approachKeyCarrier(game, player, "chest_key")
@@ -4174,14 +4678,33 @@ local function tickWorld(game, player)
           tostring(carrier.actorType), carrier.position.x, carrier.position.y) or "none",
         kx and string.format("%d,%d", kx, ky) or "none")
     end
+
+    -- The generator guarantees one key per locked chest, but a save that
+    -- already spent or dusted the key leaves the run with no way out. Say so
+    -- once instead of walking in circles until the timeout.
+    if not carrier and not kx and not S.blockedLogged then
+      S.blockedLogged = true
+      log("BLOCKED: exit chest at %d,%d is locked and no chest_key exists on this level", cx, cy)
+      ev("dungeon_blocked", { world = game.currentWorldName, x = cx, y = cy, reason = "chest_key_missing" })
+    end
   end
+
+  -- Full-loot rule: every reachable container on the level is opened before
+  -- moving on. Chest keys and consumables hide in crates and barrels, and a
+  -- run that skips them can finish the dungeon without its prize. Wounded
+  -- runs still sweep: healing decisions stay in combatStep and the
+  -- danger-avoidance routing above keeps contact down when recovery is gone.
+  if Loot.sweepStep(game, player) then return end
 
   local fx, fy, steps = findFrontier(game, player)
   if fx and steps and steps[1] then
-    S.phase = "explore"
-    pressDelta(steps[1].x, steps[1].y)
-    S.stuckSince = nil
-    return
+    if not Loot.lockedAhead(game, px, py, steps) then
+      S.phase = "explore"
+      pressDelta(steps[1].x, steps[1].y)
+      S.stuckSince = nil
+      return
+    end
+    S.phase = "locked-ahead"
   end
 
   if trySecretDoorSweep(game, player) then
@@ -4202,6 +4725,69 @@ local function tickWorld(game, player)
     return
   end
 
+  -- Nothing left to see or loot on this level: record it once. Containers
+  -- annotated as locked/unreachable do not block completion; they are
+  -- reported in the event so a missing key is visible in the log.
+  local lvl = Loot.rec(game.currentWorldName)
+  if not lvl.done then
+    lvl.done = true
+    local total, pending, annotated = 0, 0, 0
+    for _, c in pairs(lvl.containers) do
+      total = total + 1
+      if c.state == "pending" then
+        pending = pending + 1
+        if c.problem then annotated = annotated + 1 end
+      end
+    end
+    log("LEVEL DONE: %s (loot %d/%d, annotated %d, known %d, visit %d)",
+      tostring(game.currentWorldName), total - pending, total, annotated,
+      lvl.knownCount, lvl.visited)
+    ev("level_done", {
+      world = game.currentWorldName, x = px, y = py, containers = total,
+      looted = total - pending, annotated = annotated, known = lvl.knownCount,
+      visit = lvl.visited,
+    })
+  end
+
+  -- Post-key survival policy (top-offs, spending the last charge, preferring
+  -- disengages) only applies once the floor is looted and the exit is the
+  -- actual next destination. Mid-sweep the run still needs its resources.
+  S.exitReady = hasMasterKey and lvl.done or false
+
+  if hasMasterKey then
+    -- The key opens the way out at the top, but the deeper floors still have
+    -- to be finished first: descend when the floor below was never visited
+    -- or never completed. On the way back up every lower floor is done, so
+    -- this check sends the run straight to the stairs.
+    local deeper = Loot.deeperWorld(game)
+    local below = deeper and Loot.rec(deeper)
+    if deeper and not (below and below.done) then
+      S.phase = "to-descend-key"
+      if Loot.stairsStep(game, player, "fnDown", "descend-key") then return end
+    end
+    S.phase = "to-exit"
+    if Loot.stairsStep(game, player, "fnUp", "climb") then return end
+    local ex, ey = dungeonExitXY(game)
+    if ex then
+      if px == ex and py == ey then
+        pressKey("return")
+      else
+        navigateOrOpenDoor(game, player, ex, ey)
+      end
+      return
+    end
+    log("master key found but no exit stairs trigger")
+    return
+  end
+
+  -- No key: keep going down while there is a way down.
+  S.phase = "to-descend"
+  if Loot.stairsStep(game, player, "fnDown", "descend") then return end
+
+  -- Bottom of the dungeon without the key: the relic guardian (or the key
+  -- carrier) is still alive somewhere. Hunt it; its death drops the key.
+  if Loot.huntStep(game, player) then return end
+
   S.phase = "stuck"
   if not S.stuckShot and love.graphics and love.graphics.captureScreenshot then
     S.stuckShot = true
@@ -4213,8 +4799,21 @@ local function tickWorld(game, player)
   S.stuckSince = S.stuckSince or t
   if t - (S.stuckLoggedAt or 0) > 10 then
     S.stuckLoggedAt = t
-    log("no frontier and no key at %d,%d (known %d, stuck %ds)",
-      px, py, S.knownCount, math.floor(t - S.stuckSince))
+    local total, pending, annotated = 0, 0, 0
+    for _, c in pairs(lvl.containers) do
+      total = total + 1
+      if c.state == "pending" then
+        pending = pending + 1
+        if c.problem then annotated = annotated + 1 end
+      end
+    end
+    log("level swept, nowhere to go at %d,%d (known %d, loot %d pending/%d, stuck %ds)",
+      px, py, lvl.knownCount, pending, total, math.floor(t - S.stuckSince))
+    ev("stuck", {
+      world = game.currentWorldName, x = px, y = py, source = "dungeon",
+      known = lvl.knownCount, pending = pending, containers = total,
+      annotated = annotated, idle = math.floor(t - S.stuckSince),
+    })
   end
 end
 
@@ -4237,6 +4836,7 @@ local function tick(game)
       S.phase)
   end
 
+  if watchdog(game, player) then return end
   if handleDialogs(game) then return end
   if game.isGameOver then return end
 
@@ -4269,9 +4869,11 @@ local function checkGlobal()
       S.started = true
       if G_stateTitleScreen.saveGameExists then
         log("continuing existing save")
+        ev("bot", {state = "continue"})
         G_stateTitleScreen:openStartOptions()
       else
         log("starting fresh game as %s", CFG.name)
+        ev("bot", {state = "fresh", name = CFG.name})
         G_stateTitleScreen:startFreshGame(CFG.name)
       end
     end
@@ -4315,6 +4917,10 @@ local function checkGlobal()
       tostring(game.currentWorldName), player.position.x, player.position.y,
       tostring(gGameTurn), tostring(cellTypeName(dc)), tostring(player.isAflame))
     log("last messages: %s", table.concat(recentTexts, " | "))
+    ev("death", {
+      world = game.currentWorldName, x = player.position.x, y = player.position.y,
+      turn = gGameTurn, cell = cellTypeName(dc), last = table.concat(recentTexts, " | "),
+    })
     if CFG.quit then
       love.event.quit(1)
     else
@@ -4341,6 +4947,10 @@ local function checkGlobal()
     log("FAIL: timeout after %ds in %s at %d,%d (turn %s)",
       CFG.timeout, tostring(game.currentWorldName), player.position.x,
       player.position.y, tostring(gGameTurn))
+    ev("timeout", {
+      world = game.currentWorldName, x = player.position.x, y = player.position.y,
+      turn = gGameTurn, phase = S.phase, timeout = CFG.timeout,
+    })
     if CFG.quit then
       love.event.quit(3)
     else
@@ -4363,7 +4973,8 @@ local function checkGlobal()
       tostring(hasItem(player, "chest_key")), tostring(chestCell),
       tostring(cx), tostring(cy),
       tostring(minor and minor.count or 0), tostring(major and major.count or 0),
-      tostring(stone and stone.durability or 0), S.phase, S.knownCount)
+      tostring(stone and stone.durability or 0), S.phase,
+      Loot.rec(game.currentWorldName).knownCount)
     pcall(function()
       local ps = game:getPlayerStats()
       local devs = {}
@@ -4419,8 +5030,10 @@ local function pollToggle()
       S.masterKeyLogged = false
       S.stuckShot = nil
       log("bot ENABLED (toggle=%s speed=%d)", CFG.toggleKey, SPEED)
+      ev("bot", {state = "enabled", speed = SPEED})
     else
       log("bot DISABLED")
+      ev("bot", {state = "disabled"})
     end
   end
   S.toggleHeld = down
