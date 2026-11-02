@@ -189,9 +189,26 @@ huir — la estrategia no cambia, solo su percepción del riesgo.
   y compara los eventos `EV|` de `death`/`timeout`. El campo `by=` del evento
   `death` dice quién mató.
 - **Reiniciar el conocimiento**: borra `zzbot_knowledge.lua`.
-- Segundo nivel planeado: `tools/evolve.lua` — búsqueda evolutiva offline de
-  los knobs del modelo (alpha, horizonte…) usando éxito/muerte como
-  recompensa verificable.
+- **Búsqueda evolutiva (`tools/evolve.lua`, offline)**: el genoma son los
+  knobs del modelo (`alpha`, `horizon`, reservas de oro, márgenes de comercio)
+  y la recompensa es verificable (mazmorras completadas, muertes, timeouts de
+  los logs `EV|`). Ciclo:
+
+  ```sh
+  lua tools/evolve.lua next                  # imprime la línea de env del siguiente genoma
+  ZZBOT_ALPHA=... ZZBOT_HORIZON=... tools/run.sh   # evalúa esa partida (headless)
+  lua tools/evolve.lua record logs/zzbot.log  # puntúa la corrida en el genoma
+  lua tools/evolve.lua status                # tabla de la población
+  ```
+
+  Cuando la población completa está puntuada, evoluciona solo: élite intacta,
+  resto por torneo + cruce uniforme + mutación gaussiana con clamp a los
+  límites. El genoma #1 de cada generación es el default de fábrica, así que
+  la búsqueda solo puede alejarse de lo conocido si la evidencia lo empuja.
+  Estado reproducible (`work/evolve_state.lua`, LCG con semilla).
+- **No implementado (a propósito)**: RL profundo / redes neuronales en juego.
+  Datos escasos y ruidosos, LÖVE/Lua sin autodiff y un PC modesto — el bandit
+  + GA + logs capturan casi todo el valor sin dependencias nuevas.
 
 ## Estado actual y limitaciones
 

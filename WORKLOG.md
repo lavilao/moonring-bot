@@ -1255,6 +1255,35 @@ al modelo Monte Carlo que ya teníamos:
   con la muerte/éxito como recompensa verificable. Ese es el segundo nivel
   del sistema de aprendizaje acordado.
 
+### Test57 — P8b: búsqueda evolutiva offline (`tools/evolve.lua`)
+
+Segundo nivel del aprendizaje: el genoma son los knobs con ruta de env
+(`alpha`, `horizon`, `moneyReserve`, `sellHold`, `tradeMargin`, `tradeTake`)
+y la recompensa es verificable desde los logs `EV|` que ya existían
+(`campaign_done` +200, `dungeon_done` +50, `level_done` +10, `objective` +3,
+`death` −30, `timeout` −15). Nunca lanza el juego: es un driver que el
+operador alimenta (`next` imprime la línea de env de un individuo; `record`
+puntúa la corrida en el log; al completarse la población evoluciona solo).
+
+- **GA**: élite de 2 copiada verbatim, resto por torneo(3) + cruce uniforme
+  por gen + mutación gaussiana (σ=15% del rango, p=0.5), todo con clamp a
+  los límites declarados en `M.SPEC`. El individuo #1 de cada generación es
+  el default de fábrica — la búsqueda parte siempre de lo conocido y solo se
+  aleja si el fitness lo justifica.
+- **Reproducible**: estado en `work/evolve_state.lua` (fuente Lua, carga con
+  validación estricta como el knowledge ledger) con la semilla del LCG
+  guardada; `EVOLVE_STATE` redirige el fichero. `reset` limpia.
+- 11 tests en `tools/test_evolve.lua`: parseo de `EV|`, pesos de fitness,
+  clamps y defaults del genoma, línea de env, semilla de población (stock
+  primero, resto en límites), evolución (élite intacta, límites respetados,
+  reset de fitness), LCG determinista, round-trip de estado, ciclo
+  next/record y disparo de generación nueva al completar la población.
+- 13/13 ficheros de test en verde bajo Lua 5.1 y 5.5.
+- Uso real (en el PC del usuario, donde vive el AppImage): bucle
+  `next → run headless con la línea de env → record` repetido; una
+  generación de 6 genomas × 2 corridas ≈ una noche. Ver WORKLOG Test56 para
+  el nivel 1 (ledger de amenazas en juego).
+
 ### Estado de las fases tras la branch `glm`
 
 | Fase | Alcance | Estado |
@@ -1268,6 +1297,7 @@ al modelo Monte Carlo que ya teníamos:
 | P6 | planner de campaña + grafo | módulos + tests; observación tras flag |
 | P7 | patas de viaje, spike del mar | módulo + tests; spike documentado |
 | P8 | conocimiento aprendido de muertes (`zzbot.knowledge`) | módulo + tests; modulación tras `ZZBOT_LEARN` |
+| P8b | GA offline sobre knobs del modelo (`tools/evolve.lua`) | módulo + tests + CLI; la evaluación corre en el PC del usuario |
 
 Bloqueado por verificación headless (necesita el AppImage en `work/`):
 ejecución de `shoot`/`power` en el chooser, binding de skills (§8.9), nombres
