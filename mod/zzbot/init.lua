@@ -4805,6 +4805,25 @@ local function tickWorld(game, player)
         S.phase = "ferry-inn"
         return
       end
+      -- P5 §3.6 observability: the crossing ambushes killed the bot at
+      -- 400->0 hp, so every sail logs the readiness verdict the model would
+      -- demand (full hp, poise, heals aboard). Data first, policy later.
+      if Model and Model.readiness then
+        local minor, major = findHealPotion(player)
+        local wand = findLifestone(player)
+        local heals = (minor and minor.count or 0) + (major and major.count or 0)
+          + lsUses(wand)
+        local ok, reasons = Model.readiness(modelState(game, player), {
+          heals = heals, minHeals = 1,
+        })
+        if not ok then
+          log("zoom readiness failed: %s", table.concat(reasons, ", "))
+        end
+        ev(ok and "zoom_ready" or "zoom_not_ready", {
+          world = name, heals = heals,
+          reasons = ok and "" or table.concat(reasons, ";"),
+        })
+      end
       if ferryStep(game, player) then
         S.phase = "ferry"
         return

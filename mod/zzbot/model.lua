@@ -440,6 +440,21 @@ local function adjacentEnemyIndex(sim)
   return best
 end
 
+-- Ranged shots and powers reach farther than the fists: nearest living enemy
+-- inside the stated reach, choke funnel notwithstanding (arrows fly over a
+-- funnel). Returns nil when nothing is in reach so the caller's shot is a
+-- whiff that still costs its time.
+local function rangedEnemyIndex(sim, range)
+  local best, bestGap
+  for i = 1, #sim.enemies do
+    local e = sim.enemies[i]
+    if e.alive and e.gap <= range + EPS then
+      if not best or e.gap < bestGap then best, bestGap = i, e.gap end
+    end
+  end
+  return best
+end
+
 local function adjacentMinion(sim)
   local best, bestRate
   for i = 1, #sim.minions do
@@ -518,6 +533,52 @@ local function firstAction(sim, action)
     end
     if idx then damageEnemy(sim, idx, hitOn(sim, sim.enemies[idx])) end
     local T = math.max(0, num(action.time, prof.attackTime))
+    local t0 = sim.t
+    enemyPhase(sim, T)
+    if sim.hp > 0 then advanceTo(sim, t0 + T) end
+  elseif kind == "shoot" then
+    -- Ranged: the shot reaches the nearest enemy inside action.range and
+    -- costs its own time unit. Ammo gating is the caller's job; the model
+    -- only needs the damage the shot would deal.
+    local range = math.max(1, num(action.range, 5))
+    local idx = action.target
+    if not (idx and sim.enemies[idx] and sim.enemies[idx].alive
+            and sim.enemies[idx].gap <= range + EPS) then
+      idx = rangedEnemyIndex(sim, range)
+    end
+    if idx then
+      damageEnemy(sim, idx, num(action.damage, hitOn(sim, sim.enemies[idx])))
+    end
+    local T = math.max(0, num(action.time, prof.attackTime))
+    local t0 = sim.t
+    enemyPhase(sim, T)
+    if sim.hp > 0 then advanceTo(sim, t0 + T) end
+  elseif kind == "power" then
+    -- Powers: single-target damage, an AOE blast over every living enemy
+    -- inside radius, or a self heal. Energy and cooldown are gated
+    -- caller-side; descriptor values come from zzbot.powers.
+    local range = math.max(1, num(action.range, 6))
+    local radius = math.max(1, num(action.radius, 1))
+    local dmg = num(action.damage, 0)
+    if dmg > 0 then
+      if radius > 1 then
+        for i = 1, #sim.enemies do
+          local e = sim.enemies[i]
+          if e.alive and e.gap <= radius + EPS then
+            damageEnemy(sim, i, dmg)
+          end
+        end
+      else
+        local idx = action.target
+        if not (idx and sim.enemies[idx] and sim.enemies[idx].alive
+                and sim.enemies[idx].gap <= range + EPS) then
+          idx = rangedEnemyIndex(sim, range)
+        end
+        if idx then damageEnemy(sim, idx, dmg) end
+      end
+    end
+    if num(action.heal, 0) > 0 then healPlayer(sim, action.heal) end
+    local T = math.max(0, num(action.time, M.C.USE_TIME))
     local t0 = sim.t
     enemyPhase(sim, T)
     if sim.hp > 0 then advanceTo(sim, t0 + T) end
@@ -689,6 +750,29 @@ end
 function M.evaluate(action, state, pack, prof, opts)
   local index = num(action and action.index, num(opts and opts.actionIndex, 0))
   return evaluateAt(action, state, pack, prof, opts, index)
+end
+
+-- Zoom readiness (PLAN §3.6, P5): a crossing is only survivable from full
+-- health with healing on board. Returns ready, reasons[] so the caller can
+-- log exactly what kept the bot out.
+-- state = { hp, maxHP, poise, maxPoise } ; opts = { minHeals, heals, energy }
+function M.readiness(state, opts)
+  opts = opts or {}
+  local reasons = {}
+  local hp = num(state and state.hp, 0)
+  local maxHP = math.max(1, num(state and state.maxHP, 1))
+  if hp < maxHP then
+    reasons[#reasons + 1] = ("hp %d/%d"):format(hp, maxHP)
+  end
+  if (opts.heals or 0) < (opts.minHeals or 1) then
+    reasons[#reasons + 1] = "no heals"
+  end
+  local poise = num(state and state.poise, 0)
+  local maxPoise = math.max(1, num(state and state.maxPoise, M.C.MAX_POISE))
+  if poise < maxPoise * 0.5 then
+    reasons[#reasons + 1] = ("poise %.0f/%.0f"):format(poise, maxPoise)
+  end
+  return #reasons == 0, reasons
 end
 
 function M.evaluateAll(actions, state, pack, prof, opts)

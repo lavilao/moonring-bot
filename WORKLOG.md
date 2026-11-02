@@ -1142,3 +1142,26 @@ Sexta fase del plan (§3.4). Tres módulos puros (32 tests) + cableado mínimo:
   `CActions.static.data` que registra energía/targeting/radio de cada poder
   para autorar los tags contra datos reales (§8.7). Nunca enlaza teclas ni
   dispara nada.
+
+### Test53 — P5: modelo de combate v2 (ranged, poderes AOE, readiness de Zoom)
+
+Séptima fase del plan (§3.5/§3.6). El simulador gana dos tipos de acción y
+la comprobación de preparación; 16 tests nuevos y los 16 del model original
+siguen en verde (sin regresión en el reloj de veneno/poise/summons):
+
+- **`shoot`** (ranged): alcanza al enemigo vivo más cercano dentro de
+  `action.range` (las flechas vuelan sobre el embudo de choke), falla fuera
+  de rango pero cuesta su tiempo. El gating de munición es del caller.
+- **`power`**: daño single-target o barrido AOE sobre todo enemigo vivo dentro
+  de `radius`, o curación propia; energía/cooldown se gatean en el caller
+  (zzbot.powers.shouldFire). Los tests cubren: aoe limpia un pack de 3,
+  respeta el radio, heal power repone HP sin mordiscos, y `M.rank` prefiere
+  el power que arrasa el pack sobre un golpe simple.
+- **`M.readiness`** (§3.6): hp al completo, ≥1 curación a bordo y poise ≥50 %;
+  devuelve reasons[] para el log. Cableado como observabilidad en la rama de
+  ferry (`EV|kind=zoom_ready|zoom_not_ready`): los datos primero, la política
+  (poderes + kiting con energía) cuando la ejecución de disparos esté
+  verificada (§8: semántica de disparo y bindings de skill_tree).
+- La ejecución de `shoot`/`power` en buildCombatOptions queda deliberadamente
+  fuera hasta verificar cómo dispara el juego (bump vs tecla de fuego);
+  ofrecer opciones no ejecutables rompería el chooser.
