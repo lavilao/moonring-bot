@@ -108,6 +108,11 @@ tools/unit.sh test_confirm # uno solo
 | `ZZBOT_TRADE` | `1` | `0` = desactivar el arbitraje de mercancías |
 | `ZZBOT_TRADE_MARGIN` | `1.20` | Margen mínimo esperado al comprar (venta ≥ 1.2× coste) |
 | `ZZBOT_TRADE_TAKE` | `1.10` | Umbral para vender mercancía comprada (≥ 1.1× coste) |
+| `ZZBOT_GEAR` | `0` | `1` = equipar el mejor equipo por slot (`zzbot.gear`, sin verificar headless) |
+| `ZZBOT_LAMP` | `0` | `1` = gestionar la lámpara de ámbar (`amber_state` en el log) |
+| `ZZBOT_DIALOGUE` | `0` | `1` = driver de diálogo: agotar keywords, teclear frases de campaña |
+| `ZZBOT_POWERS` | `0` | `1` = sonda one-shot del catálogo `CActions` en el log |
+| `ZZBOT_CAMPAIGN` | `0` | `1` = el planner de campaña registra el objetivo que elegiría (`objective`) |
 | `ZZBOT_TRADE_DEBUG` | `0` | `1` = volcar en el log los mejores spreads de cada ciudad |
 | `ZZBOT_MONEY_RESERVE` | `150` | Guineas intocables (ferry, posada, imprevistos) |
 | `ZZBOT_SELL_HOLD` | `0.95` | Con reserva cubierta, no vender si la demanda local es menor |

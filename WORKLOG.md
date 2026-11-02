@@ -1190,3 +1190,41 @@ cableado es observación, no cambio de ruta:
   `isPropertyNonZero` (con pcall) como evaluador de props. La ruta estricta
   TOWN_ORDER sigue mandando hasta validar predicados en headless; entonces
   el switch de ruta es el siguiente paso.
+
+### Test55 — P7: planificador de patas de viaje y spike del mar (`zzbot.travel`)
+
+Novena y última fase planificada (§4.2.3 + §3.10). El plan manda spike antes
+que código para el mar, así que P7 entrega el planificador puro de patas y
+las preguntas del spike como datos:
+
+- **`mod/zzbot/travel.lua`**: un GoTo se resuelve en patas ordenadas
+  (`town_exit → ferry|overworld|sea → town_enter → dungeon_entry`). El único
+  cruce verificado (Moon-upon-Thoss ↔ Barrow-Linn) es `FERRY_ROUTES`; un
+  objetivo `needsShip` planea una pata `sea` con `blocked="no ship"` en vez
+  de fingir, y `M.blocked` la devuelve sin atascar el resto. `M.SEA_SPIKE`
+  lista las cinco preguntas que el spike debe responder (deed, claim,
+  isSailing, cañones, si la Tower necesita barco).
+- 8 tests. Los ejecutores reales siguen siendo `overRoute`/`ferryLegStep` en
+  `init.lua` (verificados en Test48); el planificador decide, no camina.
+- **Fin de partida**: ya cubierto por `campaign_data` (tether → archon con
+  `requires={relics=5}` / `killedGods`), la refusal del planner (Test54) y la
+  ending gate del watchdog/handleDialogs (Test49). Tres capas sobre el final
+  malo.
+
+### Estado de las fases tras la branch `glm`
+
+| Fase | Alcance | Estado |
+|---|---|---|
+| P0 | métricas, watchdog, confirm guard, arnés, module split lotes 1-2 | completo (Test47+49) |
+| P1 | ledger, barrido completo, escaleras, ruta estricta | completo (Test48, previo) |
+| P2 | gear scoring/equip/burden/lámpara | módulos + tests; cableado tras flags |
+| P3 | driver de diálogo | módulo + tests; cableado tras flag |
+| P4 | dioses, tabú, poderes (política+solvers) | módulos + tests; tabú en equip; sonda de catálogo |
+| P5 | modelo v2 (ranged/AOE/power), readiness | módulo + tests; readiness en ferry |
+| P6 | planner de campaña + grafo | módulos + tests; observación tras flag |
+| P7 | patas de viaje, spike del mar | módulo + tests; spike documentado |
+
+Bloqueado por verificación headless (necesita el AppImage en `work/`):
+ejecución de `shoot`/`power` en el chooser, binding de skills (§8.9), nombres
+de objetos de lámpara (§8.12), predicados de reliquia (§8.4/§8.15) y el
+switch real de ruta TOWN_ORDER → planner.
