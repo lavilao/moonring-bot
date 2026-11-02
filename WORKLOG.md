@@ -1010,3 +1010,52 @@ Arreglos:
   (`level_enter@from=firstDungeon-01`) y `!death`.
 
 En curso: `tools/regress.sh dungeon newgame` con TIMEOUT 300/900.
+
+### Test49 — branch `glm`: módulos confirm/ending_gate/metrics y puerta de final (P0, lotes 1-2)
+
+Tercer incremento del `PLAN.md` (completa los lotes 1-2 del module split §0.2
+y resuelve el conflicto #3), sobre el arnés de Test47/48. Cada extracción se
+hizo sin cambiar el comportamiento y con tests puros que corren sin el juego
+(`tools/unit.sh`, luajit o lua):
+
+- **`mod/zzbot/confirm.lua`**: el clasificador de confirmaciones y su política
+  salen de `init.lua` como funciones puras (`classify(text)`,
+  `decide(class, ctx)` con `ctx = {phase, entered}`). `init.lua` conserva una
+  copia inline literal como fallback si el módulo no carga (mismo patrón de
+  degradación que `zzbot.model`). `tools/test_confirm.lua`: robo→theft,
+  prefijos `dungeon_*`, clases irreversibles siempre declinadas, entrada solo
+  con `phase=to-dungeon`/`entered`, desconocido declina en cualquier contexto.
+- **Normalización de espacios en el clasificador**: el `bodyText` del juego
+  puede partir la frase en varias líneas; colapsando `%s+` a un espacio el
+  matching por substring ya no pierde clases por reflow. Solo promueve
+  `unknown → clasificado`; la política de aceptación no cambia y el
+  desconocido sigue declinándose.
+- **`mod/zzbot/ending_gate.lua`** (conflicto #3 del plan / riesgo #6): hablar
+  con el Archonte con solo las reliquias dispara el final malo, así que la
+  puerta bloquea cualquier avance de speech en mundos `archon*`/`endgame*`
+  hasta que el Tether esté muerto. Señales aceptadas (OR): propiedad
+  `killed_tether` del juego (leída con pcall), flag `killedGods`, o el
+  registro propio `S.dungeonDone["dungeon6-06"]`; si la propiedad no es
+  legible la puerta permanece cerrada. `handleDialogs` no pulsa Return, emite
+  `EV|kind=archon_gate` una vez por texto y pulsa Escape. **El watchdog
+  también cede ante la puerta**: su escalera Return→Espacio→Escape ya no
+  pulsa Return/Espacio sobre speech bloqueado (si no, a los 6 s el propio
+  watchdog habría anulado la puerta); el cierre forzoso por API del stage 4
+  sigue disponible porque descarta sin avanzar el diálogo.
+  `tools/test_ending_gate.lua`: pueblos/mazmorras normales nunca bloqueados,
+  archon/endgame bloqueados antes del Tether, las tres señales lo levantan.
+- **`mod/zzbot/metrics.lua`** (§0.3): `log`/`ev` salen de `init.lua` con reloj
+  inyectable (`Metrics.init{logpath, t0, clock}`), así que el formato `EV|`
+  sobre el que afirma `check_log.lua` queda cubierto por
+  `tools/test_metrics.lua`: orden de claves estable, saneado de valores,
+  prefijo `[zzbot] `, escritura y timestamp en fichero, reapertura al cambiar
+  `logpath`. Fallback inline literal en `init.lua`.
+- **`tools/unit.sh`**: corre todos los `tools/test_*.lua` con luajit (o lua
+  de sistema) sin abrir el juego; los 4 ficheros (confirm, ending_gate,
+  metrics, model) pasan. Los escenarios headless de `regress.sh` siguen sin
+  ejecutarse aquí (necesitan el AppImage extraído en `work/`), así que la
+  puerta y los módulos deben revalidarse con `tools/regress.sh smoke yarrow`
+  y `dungeon` en cuanto haya entorno de juego.
+
+Pendiente (próximos lotes del split §0.2): `nav.lua`, `interact.lua`,
+`ledger.lua`, `gear.lua` (P2), `dialogue.lua` (P3).

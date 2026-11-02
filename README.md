@@ -77,6 +77,18 @@ tools/regress.sh --list
 tools/regress.sh smoke yarrow
 ```
 
+### Tests unitarios
+
+Los módulos extraídos (`zzbot.confirm`, `zzbot.ending_gate`,
+`zzbot.metrics`, `zzbot.model`) tienen tests puros en `tools/test_*.lua` que
+corren sin abrir el juego:
+
+```bash
+tools/unit.sh              # todos, con luajit o lua de sistema
+tools/unit.sh test_confirm # uno solo
+```
+
+
 ## Variables de entorno
 
 | Variable | Default | Descripción |
