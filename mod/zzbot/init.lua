@@ -13,6 +13,10 @@ local EndingGate
 -- The ending gate (PLAN conflict #3): refuses to advance speech with the
 -- Archon before the Tether is dead. Missing module degrades to no gate.
 pcall(function() EndingGate = require("zzbot.ending_gate") end)
+local Gear
+-- Gear scoring and burden policy (PLAN §3.2). Missing module degrades to the
+-- plain sell protection that already exists.
+pcall(function() Gear = require("zzbot.gear") end)
 
 -- True while pressing Return on the open speech box could trigger an ending.
 -- Every signal is best-effort: the game property is read through a pcall and
@@ -55,6 +59,8 @@ local CFG = {
   tradeMargin = tonumber(os.getenv("ZZBOT_TRADE_MARGIN")) or 1.20,
   tradeTake = tonumber(os.getenv("ZZBOT_TRADE_TAKE")) or 1.10,
   tradeDebug = (os.getenv("ZZBOT_TRADE_DEBUG") == "1"),
+  gear      = (os.getenv("ZZBOT_GEAR") == "1"),
+  lamp      = (os.getenv("ZZBOT_LAMP") == "1"),
 }
 
 local S = {
@@ -3367,6 +3373,131 @@ local function hasRangedWeapon(inv)
   return false
 end
 
+-- ---------------------------------------------------------------------------
+-- P2 gear layer (PLAN §3.2), behind ZZBOT_GEAR=1 until a headless run
+-- verifies the objectData column names (§8.6/§8.10). The adapter maps game
+-- objects to the pure zzbot.gear records; every read is a pcall, so a missing
+-- column simply leaves the field nil and the scorer ignores that item.
+local function gearRecord(game, o)
+  local def
+  pcall(function() def = game:getObjectDataWithObjectType(o.objectType) end)
+  if not def then return nil end
+  local r = {
+    ID = o.ID, category = o.category, objectType = o.objectType,
+    price = tonumber(def.price) or 0, identified = true,
+  }
+  pcall(function()
+    r.damage = tonumber(def.damage)
+    r.timeCost = tonumber(def.weaponTimeCost) or tonumber(def.timeCost)
+    r.might = tonumber(def.mightBonus) or tonumber(def.might)
+    r.defense = tonumber(def.defense)
+    r.burden = tonumber(def.burden)
+    r.block = tonumber(def.shieldBlockFraction) or tonumber(def.block)
+    r.hands = tonumber(def.hands)
+    r.weight = tonumber(def.weight)
+  end)
+  pcall(function() r.identified = game:isObjectDataIdentified(def) ~= false end)
+  return r
+end
+
+-- One swap per tick, only in a safe context, so an equip never eats a combat
+-- turn. The gain threshold and veto handling live in zzbot.gear.
+local function equipStep(game, player)
+  if not CFG.gear or not (Gear and Gear.planEquip) then return false end
+  if now() - (S.gearT or 0) < 5 then return false end
+  for _, a in ipairs(game.actorManager.actorArray or {}) do
+    if not a.isCorpse and a ~= player and player:isEnemy(a) then
+      local d = math.max(math.abs(a.position.x - player.position.x),
+        math.abs(a.position.y - player.position.y))
+      if d <= 4 then return false end -- not safe
+    end
+  end
+  local inv = player.inventory or {}
+  local records, worn = {}, {}
+  for _, o in pairs(inv) do
+    if WEAR_SLOTS[o.category] then
+      local r = gearRecord(game, o)
+      if r then
+        records[#records + 1] = r
+        local wornOk = false
+        pcall(function() wornOk = game:isObjectWornOrWielded(o) end)
+        if wornOk then worn[o.category] = r end
+      end
+    end
+  end
+  local plan = Gear.planEquip(records, { worn = worn })
+  local swap = plan[1]
+  if not swap then return false end
+  local target
+  for _, o in pairs(inv) do
+    if o.ID == swap.to then target = o break end
+  end
+  if not target then return false end
+  S.gearT = now()
+  local ok, err = pcall(function() game:useItemWithInventoryIndex(target.ID) end)
+  if not ok then
+    log("gear: equip failed (%s)", tostring(err))
+    return false
+  end
+  log("gear: %s %s -> ID %s (gain %.2f%s)", swap.slot,
+    swap.from and tostring(swap.from) or "<empty>", tostring(swap.to),
+    swap.gain, swap.unidentified and ", unidentified" or "")
+  ev("equip", {
+    slot = swap.slot, from = swap.from or "none", to = swap.to,
+    gain = string.format("%.2f", swap.gain),
+    unidentified = swap.unidentified or nil, world = game.currentWorldName,
+  })
+  return true
+end
+
+-- P2 lamp basics (PLAN §3.9), behind ZZBOT_LAMP=1. The fuel object names are
+-- an open question (§8): with these defaults a wrong name is a silent no-op
+-- and a real lamp still toggles through the game's own inventory API.
+local LAMP_TYPES = { lamp = true }
+local FUEL_TYPES = { lamp_oil = true, oil_flask = true }
+local function lampStep(game, player)
+  if not CFG.lamp or not (Gear and Gear.lampPlan) then return false end
+  local allowAmber = true
+  pcall(function()
+    if game.worldMoon and game.worldMoon.allowAmber == false then
+      allowAmber = false
+    end
+  end)
+  local lamp, fuel
+  for _, o in pairs(player.inventory or {}) do
+    if LAMP_TYPES[o.objectType] then lamp = o end
+    if FUEL_TYPES[o.objectType] then fuel = (fuel or 0) + (o.count or 1) end
+  end
+  local plan = Gear.lampPlan({
+    allowAmber = allowAmber, hasLamp = lamp ~= nil, fuel = fuel or 0,
+    lampOn = S.lampOn or false, inDark = S.entered == true,
+  })
+  if not plan then return false end
+  if plan.supply then
+    if now() - (S.lampSupplyT or 0) > 30 then
+      S.lampSupplyT = now()
+      log("lamp: fuel at or under reserve (%s), buy more in town", tostring(fuel))
+      ev("amber_state", {
+        state = "need_fuel", fuel = fuel or 0, world = game.currentWorldName,
+      })
+    end
+    return false -- the supply run stays the supply step's job
+  end
+  if plan.toggle and lamp then
+    local ok = pcall(function() game:toggleInventoryID(lamp.ID) end)
+    if ok then
+      S.lampOn = not (S.lampOn or false)
+      log("lamp: turned %s (fuel %s)", S.lampOn and "on" or "off", tostring(fuel))
+      ev("amber_state", {
+        state = S.lampOn and "lit" or "snuffed", fuel = fuel or 0,
+        world = game.currentWorldName,
+      })
+      return true
+    end
+  end
+  return false
+end
+
 -- How many units of this object the bot is willing to part with right now.
 local function sellPlan(game, o, money, gearIDs, rangedOwned)
   if SELL_KEEP_CATEGORY[o.category] then return false end
@@ -4484,6 +4615,11 @@ local function tickWorld(game, player)
     -- Boons first: offerings, Gifts and dedication only happen in safe towns.
     if godStep(game, player) then return end
 
+    -- P2: wear the best allowed gear before selling, so the sell protection
+    -- sees the final build. Behind ZZBOT_GEAR=1 until verified headless.
+    if equipStep(game, player) then return end
+    if lampStep(game, player) then return end
+
     -- Sell surplus loot before leaving town; the ferry purse depends on it.
     if sellStep(game, player) then return end
 
@@ -4578,6 +4714,9 @@ local function tickWorld(game, player)
         S.phase = "inn-rest"
         return
       end
+      -- Light the lamp before descending when amber is allowed and there is
+      -- fuel to burn (ZZBOT_LAMP=1).
+      if lampStep(game, player) then return end
       if townSupplyStep(game, player) then
         S.phase = "town-supplies"
         return

@@ -1059,3 +1059,30 @@ hizo sin cambiar el comportamiento y con tests puros que corren sin el juego
 
 Pendiente (próximos lotes del split §0.2): `nav.lua`, `interact.lua`,
 `ledger.lua`, `gear.lua` (P2), `dialogue.lua` (P3).
+
+### Test50 — P2: puntuación de equipo, plan de equipado y escalera de burden (`zzbot.gear`)
+
+Cuarta fase del plan (§3.2 y §3.9). La lógica es pura y testada; el cableado
+queda detrás de dos flags hasta verificar en headless (§8.6/§8.10 siguen
+abiertos: columnas exactas de objectData y nombres de objetos de lámpara):
+
+- **`mod/zzbot/gear.lua`** (18 tests): melé = daño por unidad de tiempo con la
+  curva de might del modelo (`1 + min(1, might/35)`); ranged exige munición;
+  armadura = defensa por burden; escudo = bloqueo por mano suelta.
+  `planEquip` nunca baja de nivel, exige `minGain` (15 % por defecto para
+  frenar churn y apuestas sin identificar), ignora candidatos sin score y el
+  veto `allowed()` EXCLUYE del plan (gancho para la guardia de tabú de P4).
+  `dropLadder` ordena por valor/peso ascendente entre los no protegidos con
+  épsilon 1e-9 contra el residuo float de (0.9-0.7)*100. `lampPlan` solo
+  quema ámbar donde `allowAmber`, mantiene reserva 2 y pide suministro antes
+  de quedarse a oscuras.
+- **Cableado** (`init.lua`): `equipStep` (una pieza por tick, solo con
+  seguridad: sin hostiles en Chebyshev ≤ 4) se inserta en la cadena de
+  ciudad antes de `sellStep`, así la protección de venta ve el build final;
+  equipa vía el mismo `useItemWithInventoryIndex` de la curación y emite
+  `EV|kind=equip`. `lampStep` enciende antes de descender y apaga en
+  superficie vía `toggleInventoryID` con `EV|kind=amber_state`; la compra de
+  combustible queda como aviso (`state=need_fuel`) hasta verificar nombres de
+  objetos. Detrás de `ZZBOT_GEAR=1` / `ZZBOT_LAMP=1` (default off).
+- Los tests pescaron dos bugs de diseño antes del commit: el veto no excluía
+  al candidato del plan y el épsilon float soltaba un drop extra.
