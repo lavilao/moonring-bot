@@ -122,6 +122,7 @@ tools/unit.sh test_confirm # uno solo
 | `ZZBOT_HORIZON` | `480` | Horizonte temporal del modelo |
 | `ZZBOT_LEARN` | `0` | `1` = aprender de las muertes (`zzbot.knowledge`): multiplica el daño de los enemigos que nos matan |
 | `ZZBOT_KNOWLEDGE` | – | Ruta del ledger aprendido (por defecto junto al log: `zzbot_knowledge.lua`) |
+| `ZZBOT_POLICY` | `base` | Postura de riesgo: `cautious` (alpha×0.5, huye antes) o `aggressive` (alpha×1.75); `bandit` = como `base` y etiqueta los EV para A/B offline |
 | `ZZBOT_SHOT_INTERVAL` | – | Segundos entre capturas (`zzshot-NNN.png`) |
 | `ZZBOT_MAPDUMP` | – | Fichero donde volcar el mapa en cada cambio de mundo/muerte |
 
@@ -164,6 +165,9 @@ tools/unit.sh test_confirm # uno solo
 mod/zzbot/init.lua     mod (capa de juego, navegación, campaña, dioses, ferry)
 mod/zzbot/model.lua    modelo de combate Monte Carlo
 mod/zzbot/knowledge.lua  ledger aprendido de muertes (bandit Beta por enemigo)
+mod/zzbot/trace.lua      anillo de decisión (últimos 60 ticks de combate)
+tools/postmortem.lua     analista de muertes: informe legible + calibración
+tools/evolve.lua         GA offline sobre los knobs del modelo
 tools/build.sh         extrae Moonring e inyecta el mod
 tools/fetch-love.sh    descarga LÖVE 11.5
 tools/run.sh           arranca la copia moddeada con guardado aislado
@@ -188,6 +192,21 @@ huir — la estrategia no cambia, solo su percepción del riesgo.
 - **A/B**: alterna partidas con y sin `ZZBOT_LEARN=1` (mismo guardado base)
   y compara los eventos `EV|` de `death`/`timeout`. El campo `by=` del evento
   `death` dice quién mató.
+- **Postmortems (Capa 0)**: al morir, el bot vuelca los últimos 60 ticks de
+  decisión (HP, enemigos, acción elegida y lo que el modelo predijo) a
+  `logs/zzbot-trace-*.txt`. El informe de cada muerte y los agregados de
+  calibración (¿el modelo dijo "seguro" y morimos?) salen de:
+
+  ```sh
+  lua tools/postmortem.lua logs/zzbot.log logs
+  ```
+
+  Ese informe se puede pegar tal cual en una issue: dice quién mató, si el
+  modelo lo vio venir y qué hizo el bot en sus últimos ticks.
+- **Políticas alternativas (Capa 3)**: `ZZBOT_POLICY=cautious|aggressive`
+  cambia la tolerancia al riesgo del modelo (alpha ×0.5 / ×1.75) sin tocar
+  nada más. Todos los eventos `death`/`timeout` llevan `policy=`, así que el
+  A/B entre posturas se decide con `postmortem.lua` sobre varios logs.
 - **Reiniciar el conocimiento**: borra `zzbot_knowledge.lua`.
 - **Búsqueda evolutiva (`tools/evolve.lua`, offline)**: el genoma son los
   knobs del modelo (`alpha`, `horizon`, reservas de oro, márgenes de comercio)
@@ -209,6 +228,10 @@ huir — la estrategia no cambia, solo su percepción del riesgo.
 - **No implementado (a propósito)**: RL profundo / redes neuronales en juego.
   Datos escasos y ruidosos, LÖVE/Lua sin autodiff y un PC modesto — el bandit
   + GA + logs capturan casi todo el valor sin dependencias nuevas.
+- **Siguiente peldaño (Capa 2 fina)**: biblioteca de "escenarios letales"
+  (saves unos segundos antes de cada muerte) y evaluar genomas por tasa de
+  supervivencia en escenarios en vez de por partidas completas. Ya existe el
+  esqueleto (`milestone.sh` + `regress.sh`); falta el save-on-death.
 
 ## Estado actual y limitaciones
 

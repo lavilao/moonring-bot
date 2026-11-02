@@ -1284,6 +1284,49 @@ puntúa la corrida en el log; al completarse la población evoluciona solo).
   generación de 6 genomas × 2 corridas ≈ una noche. Ver WORKLOG Test56 para
   el nivel 1 (ledger de amenazas en juego).
 
+### Test58 — P9: traza de decisión, postmortem y políticas (Capas 0 y 3 del plan-Claude)
+
+Llegó un segundo plan de aprendizaje (revisión externa) con 5 capas. Cruce
+con lo que ya había en `glm`: su Capa 1 es nuestro `zzbot.knowledge` (Test56),
+su Capa 2 es `tools/evolve.lua` (Test57). Lo que faltaba y este lote entrega:
+la **Capa 0** (datos de muerte con lo que el modelo predijo) y la **Capa 3
+v1** (posturas de riesgo alternativas):
+
+- **`mod/zzbot/trace.lua`** (puro): anillo de 60 ticks de combate. Dos
+  entradas por tick cuando el modelo decide: la pre-decisión (hp, poise,
+  nº de enemigos adyacentes/cercanos, fase, mundo) y la de decisión (acción
+  elegida, `pDeath`, `pDeathUpper`, razón). Al morir, `init.lua` vuelca el
+  anillo a `logs/zzbot-trace-<epoch>.txt` (con cabecera world/turn/killer/
+  policy/alpha) y emite `EV|kind=death_trace` como puntero compacto; el
+  anillo se resetea por vida. Solo daños entrantes: nada de esto toca la
+  estrategia.
+- **`tools/postmortem.lua`** (puro, CLI): parsea el log, enlaza cada `death`
+  con su fichero de traza y produce un informe pegable-en-issue: asesino,
+  últimos mensajes, curva de HP (peor caída en 3 ticks), última decisión y —
+  lo importante para calibrar (Capa 1 fina) — dos banderas por muerte:
+  **SURPRISE** (murió haciendo algo que el modelo valoró como seguro:
+  `pDeathUpper <= alpha` sin huir) y **WARNED** (el modelo vio peligro N
+  ticks y se ignoró M veces). Agregados por asesino/mundo/política + línea
+  de calibración. El feature de predictor de la Capa 4 se entrena con estos
+  datos cuando haya corpus.
+- **`ZZBOT_POLICY=base|cautious|aggressive|bandit`** (Capa 3 v1): la misma
+  política con otra tolerancia al riesgo — `cautious` alpha×0.5, `aggressive`
+  alpha×1.75 — aplicada en boot y etiquetada en TODOS los `death`/`timeout`
+  y en el nuevo evento `policy`. `bandit` hoy = base + etiqueta: la
+  selección de brazo se decide offline comparando logs (postmortem agregada
+  por política), no en juego. La base nunca se reemplaza: es el brazo de
+  referencia.
+- Tests: 6 de anillo (coerción, capacidad, serialize con placeholders, reset)
+  y 7 de postmortem (parseo EV, lectura de traza, banderas surprise/warned,
+  informe con y sin trazas). **15/15 ficheros de test en verde bajo Lua 5.1
+  y 5.5.**
+- Qué queda del plan externo: Capa 1 fina (posteriores por atributos en vez
+  de por nombre + ajuste de ALPHA por calibración — necesita el corpus del
+  postmortem), Capa 2 fina (biblioteca de escenarios letales con
+  save-on-death; falta el hook de guardado en el juego), Capa 4 (regresión
+  logística offline exportada a Lua), Capa 5 (RL sobre `model.lua` como
+  entorno) — experimento, sin fecha.
+
 ### Estado de las fases tras la branch `glm`
 
 | Fase | Alcance | Estado |
@@ -1298,6 +1341,7 @@ puntúa la corrida en el log; al completarse la población evoluciona solo).
 | P7 | patas de viaje, spike del mar | módulo + tests; spike documentado |
 | P8 | conocimiento aprendido de muertes (`zzbot.knowledge`) | módulo + tests; modulación tras `ZZBOT_LEARN` |
 | P8b | GA offline sobre knobs del modelo (`tools/evolve.lua`) | módulo + tests + CLI; la evaluación corre en el PC del usuario |
+| P9 | traza de decisión, postmortem, políticas (Capas 0+3) | módulos + tests; traces siempre activas, políticas tras `ZZBOT_POLICY` |
 
 Bloqueado por verificación headless (necesita el AppImage en `work/`):
 ejecución de `shoot`/`power` en el chooser, binding de skills (§8.9), nombres

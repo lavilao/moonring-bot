@@ -85,6 +85,7 @@ local CFG = {
   campaign  = (os.getenv("ZZBOT_CAMPAIGN") == "1"),
   learn     = (os.getenv("ZZBOT_LEARN") == "1"),
   knowledgePath = os.getenv("ZZBOT_KNOWLEDGE"),
+  policy    = os.getenv("ZZBOT_POLICY") or "base",
 }
 
 local S = {
@@ -126,6 +127,9 @@ local S = {
 -- that nudges the combat model's damage numbers. Missing module degrades to
 -- stock behaviour (multiplier 1.0 everywhere).
 pcall(function() S.Knowledge = require("zzbot.knowledge") end)
+-- Decision-trace ring (P9): the last N combat ticks, dumped on death for
+-- tools/postmortem.lua. Missing module degrades to no traces.
+pcall(function() S.Trace = require("zzbot.trace") end)
 
 -- Static data tables shared across subsystems. One top-level local instead of
 -- 26: the main chunk sits against Lua's 200-local ceiling and P6/P7 pushed it
@@ -186,9 +190,10 @@ else
   end
 end
 
--- Load the learned threat ledger once at boot. Without ZZBOT_LEARN the bot
--- never reads or writes it and every threat multiplier stays exactly 1.0.
--- Wrapped in do...end: the main chunk is at Lua's 200-local ceiling.
+-- Boot once: learned ledger, decision-trace ring and the policy profile.
+-- Without ZZBOT_LEARN the bot never reads or writes the ledger and every
+-- threat multiplier stays exactly 1.0. Wrapped in do...end: the main chunk
+-- sits against Lua's 200-local ceiling.
 do
   if S.Knowledge and CFG.learn then
     local kpath = CFG.knowledgePath
@@ -203,6 +208,19 @@ do
     ev("knowledge", { state = "on", loaded = loaded and 1 or 0,
       deaths = st.deaths, kills = st.kills, kinds = st.kinds })
   end
+  if S.Trace then S.Trace.init{ capacity = 60 } end
+  -- Alternative risk postures (PLAN-after P9 Layer 3): the same bot, a
+  -- different risk tolerance. cautious flees at half the tolerated death
+  -- probability, aggressive at nearly double. bandit logs as base for now —
+  -- arm selection by outcome is decided offline from the policy-tagged EV
+  -- lines, not in-game.
+  local policyMult = { base = 1, cautious = 0.5, aggressive = 1.75, bandit = 1 }
+  local mult = policyMult[CFG.policy] or 1
+  S.baseAlpha = CFG.alpha
+  if mult ~= 1 then CFG.alpha = CFG.alpha * mult end
+  log("policy %s: alpha %g" .. (mult ~= 1 and " -> %g" or ""),
+    CFG.policy, S.baseAlpha, CFG.alpha)
+  ev("policy", { policy = CFG.policy, alpha = string.format("%.4f", CFG.alpha) })
 end
 
 local function now()
@@ -1983,6 +2001,24 @@ local function logChoice(chosen, evals, reason)
     table.concat(parts, " "))
 end
 
+-- P9 Layer 0: one ring entry per combat tick. The pre-decision entry carries
+-- the state features; the model branch adds a second entry with the chosen
+-- action and what the model predicted, which is what makes calibration
+-- measurable after the fact (did "safe" actions actually kill us?).
+local function traceTick(game, player, chosen, reason, nAdj, nNear)
+  if not S.Trace then return end
+  S.Trace.push({
+    turn = gGameTurn, hp = player.health, maxHP = player.maxHealth,
+    poise = player.poise or 0,
+    phase = S.phase, world = game.currentWorldName, policy = CFG.policy,
+    nAdj = nAdj, nNear = nNear,
+    action = chosen and chosen.action and chosen.action.label or nil,
+    pDeath = chosen and chosen.pDeath or nil,
+    pDeathUpper = chosen and chosen.pDeathUpper or nil,
+    reason = reason, alpha = CFG.alpha,
+  })
+end
+
 local function executeChoice(game, player, prof, chosen, near)
   local a = chosen.action
   local px, py = playerPos(player)
@@ -2075,6 +2111,7 @@ local function combatStep(game, player)
   local emergency = #adj > 0
     and ((player.health + poise) <= Hreq(adj, DATA.CC.C_LS, prof)
       or (poise <= 0 and player.health <= lethalBound(adj, DATA.CC.C_LS)))
+  traceTick(game, player, nil, "pre", #adj, #near)
 
   local function bump(t)
     pressDelta(t.actor.position.x - px, t.actor.position.y - py)
@@ -2111,6 +2148,7 @@ local function combatStep(game, player)
       deadEnd, nPot, bestPot, wand, charges, emergency, fleeWanted)
     if chosen then
       logChoice(chosen, evals, reason)
+      traceTick(game, player, chosen, reason, #adj, #near)
       if executeChoice(game, player, prof, chosen, near) then return true end
     end
   end
@@ -5442,9 +5480,30 @@ local function checkGlobal()
     local dfields = {
       world = game.currentWorldName, x = player.position.x, y = player.position.y,
       turn = gGameTurn, cell = cellTypeName(dc), last = table.concat(recentTexts, " | "),
+      policy = CFG.policy,
     }
     if killer then dfields.by = killer end
     ev("death", dfields)
+    -- P9 Layer 0: dump the decision ring for tools/postmortem.lua, then a
+    -- compact EV pointer so a log alone locates the full trace file.
+    if S.Trace then
+      local ts = S.Trace.stats()
+      local tname = string.format("zzbot-trace-%d.txt", os.time())
+      local tdir = CFG.logpath and (CFG.logpath:gsub("[^/\\]+$", "")) or "logs/"
+      pcall(function()
+        local tf = io.open(tdir .. tname, "w")
+        if tf then
+          tf:write(string.format("death|world=%s|turn=%s|by=%s|policy=%s|alpha=%.4f\n",
+            tostring(game.currentWorldName), tostring(gGameTurn),
+            tostring(dfields.by), CFG.policy, CFG.alpha))
+          tf:write(S.Trace.serialize())
+          tf:close()
+        end
+      end)
+      ev("death_trace", { file = tname, ticks = ts.n, dropped = ts.dropped,
+        world = game.currentWorldName, policy = CFG.policy })
+      S.Trace.reset()
+    end
     if CFG.quit then
       love.event.quit(1)
     else
@@ -5474,6 +5533,7 @@ local function checkGlobal()
     ev("timeout", {
       world = game.currentWorldName, x = player.position.x, y = player.position.y,
       turn = gGameTurn, phase = S.phase, timeout = CFG.timeout,
+      policy = CFG.policy,
     })
     if CFG.quit then
       love.event.quit(3)
