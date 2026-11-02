@@ -4100,7 +4100,7 @@ if Confirm.classify and Confirm.decide then
   end
 else
   classifyConfirm = function(text)
-    local t = tostring(text or ""):lower()
+    local t = (tostring(text or ""):lower():gsub("%s+", " "))
     local function has(s) return t:find(s, 1, true) ~= nil end
     if has("do you want to steal") then return "theft" end
     if has("leave this area") then return "zoom_leave" end

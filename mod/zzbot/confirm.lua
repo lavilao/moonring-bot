@@ -9,10 +9,10 @@
 local M = {}
 
 -- Map a confirm bodyText to a policy class. Matching is plain-substring on
--- the lowercased text, so game-side reflowing (extra whitespace, wrapping)
--- cannot hide the class.
+-- the lowercased text after collapsing whitespace, so game-side reflowing
+-- (line wrapping inside a long prompt, extra spaces) cannot hide the class.
 function M.classify(text)
-  local t = tostring(text or ""):lower()
+  local t = (tostring(text or ""):lower():gsub("%s+", " "))
   local function has(s) return t:find(s, 1, true) ~= nil end
   if has("do you want to steal") then return "theft" end
   if has("leave this area") then return "zoom_leave" end

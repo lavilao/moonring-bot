@@ -25,11 +25,13 @@ run("steal prompt is classified theft", function()
     "got " .. tostring(C.classify("Do you want to steal this item?")))
 end)
 
-run("classification ignores case", function()
+run("classification ignores case and whitespace reflow", function()
   check(C.classify("DO YOU WANT TO STEAL this?") == "theft", "uppercase failed")
   check(C.classify("  leave this area?  ") == "zoom_leave", "padding failed")
-  check(C.classify("Are you sure you wish to enter this place?") == "dungeon_entry",
-    "entry prompt misclassified")
+  check(C.classify("Leave\nthis\narea?") == "zoom_leave", "line wrap failed")
+  check(C.classify("Are you sure you wish to\nenter this place?") == "dungeon_entry",
+    "wrapped entry prompt misclassified")
+  check(C.classify("  leave  this  area ?  ") == "zoom_leave", "double spaces failed")
 end)
 
 run("every dungeon flavor keeps its dungeon_ prefix", function()
