@@ -9,6 +9,28 @@ local Model
 -- The combat model lives in its own module so it can be simulated and tested
 -- without the game. Missing module degrades to the old heuristic path.
 pcall(function() Model = require("zzbot.model") end)
+local EndingGate
+-- The ending gate (PLAN conflict #3): refuses to advance speech with the
+-- Archon before the Tether is dead. Missing module degrades to no gate.
+pcall(function() EndingGate = require("zzbot.ending_gate") end)
+
+-- True while pressing Return on the open speech box could trigger an ending.
+-- Every signal is best-effort: the game property is read through a pcall and
+-- the bot's own dungeon ledger backs it up, so an unreadable property keeps
+-- the gate closed instead of opening it.
+local function endingGateBlocked(game)
+  if not (EndingGate and EndingGate.blocked) then return false end
+  local tetherDead = false
+  if game.speechArea then
+    pcall(function()
+      tetherDead = game.speechArea:isPropertyNonZero("killed_tether") and true or false
+    end)
+  end
+  return EndingGate.blocked(game.currentWorldName, {
+    killedTether = tetherDead,
+    dungeonDone = S.dungeonDone,
+  })
+end
 
 local CFG = {
   name      = os.getenv("ZZBOT_NAME") or "QwBot",
@@ -4018,7 +4040,14 @@ local function watchdog(game, player)
     log("watchdog: %s open for %.0fs (stage %d) '%s'", name, idle, stage, text:sub(1, 160))
     ev(name == "alert" and "alert_stuck" or "stuck", fields)
 
-    if stage == 1 then
+    -- The gate outranks the escalation ladder: in an ending world only the
+    -- dismissive keys are allowed, never Return or Space on a speech box.
+    -- Stage 4 still force-closes through the box API, which dismisses without
+    -- advancing the conversation.
+    local gated = (name == "speech") and endingGateBlocked(game)
+    if gated and stage < 4 then
+      pressKey("escape")
+    elseif stage == 1 then
       if name == "confirm" then box.confirm = false end
       pressKey("return")
     elseif stage == 2 then
@@ -4191,6 +4220,22 @@ local function handleDialogs(game)
     return true
   end
   if game.speechArea and game.speechArea.isOpen then
+    -- Ending gate (PLAN conflict #3): with only relics the Archon triggers
+    -- the bad ending, so his speech never advances before the Tether dies.
+    if endingGateBlocked(game) then
+      local text = tostring(game.speechArea.bodyText or game.speechArea.currentText
+        or game.speechArea.text or ""):gsub("%s+", " ")
+      if S.gateText ~= text then
+        S.gateText = text
+        log("ending gate: refusing to talk in %s before the Tether dies: '%s'",
+          tostring(game.currentWorldName), text:sub(1, 160))
+        ev("archon_gate", {
+          world = game.currentWorldName, phase = S.phase, text = text:sub(1, 120),
+        })
+      end
+      pressKey("escape")
+      return true
+    end
     pressKey("return")
     return true
   end
