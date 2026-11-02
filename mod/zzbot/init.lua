@@ -31,6 +31,11 @@ local Powers
 -- Power policy and targeting solvers (PLAN §3.4). Missing module degrades to
 -- no powers.
 pcall(function() Powers = require("zzbot.powers") end)
+local Campaign, CampaignData
+-- Campaign planner and objective graph (PLAN §4). Missing modules degrade to
+-- the strict town route.
+pcall(function() Campaign = require("zzbot.campaign") end)
+pcall(function() CampaignData = require("zzbot.campaign_data") end)
 
 -- True while pressing Return on the open speech box could trigger an ending.
 -- Every signal is best-effort: the game property is read through a pcall and
@@ -77,6 +82,7 @@ local CFG = {
   lamp      = (os.getenv("ZZBOT_LAMP") == "1"),
   dialogue  = (os.getenv("ZZBOT_DIALOGUE") == "1"),
   powers    = (os.getenv("ZZBOT_POWERS") == "1"),
+  campaign  = (os.getenv("ZZBOT_CAMPAIGN") == "1"),
 }
 
 local S = {
@@ -4469,6 +4475,48 @@ local function powerCatalogProbe()
   ev("power_catalog", { state = "ok", count = count, violent = violent })
 end
 
+-- P6 campaign observation (PLAN §4.2), behind ZZBOT_CAMPAIGN=1: the planner
+-- runs on every world change and logs the objective it would pick. The strict
+-- TOWN_ORDER route keeps driving until headless runs verify the predicates
+-- (§8.4/§8.15); this only produces the objective events to compare against.
+local function campaignState(game)
+  local state = {}
+  function state.eval(desc)
+    if not (game.speechArea and game.speechArea.isPropertyNonZero) then
+      return false
+    end
+    if desc.prop then
+      local ok, res = pcall(game.speechArea.isPropertyNonZero,
+        game.speechArea, desc.prop)
+      return ok and res or false
+    end
+    if desc.relics then
+      local n = 0
+      for i = 1, 5 do
+        local ok, res = pcall(game.speechArea.isPropertyNonZero,
+          game.speechArea, "relic_" .. i)
+        if ok and res then n = n + 1 end
+      end
+      return n >= desc.relics
+    end
+    return false
+  end
+  return state
+end
+
+local function campaignObserve(game)
+  if not (Campaign and CampaignData and Campaign.pick) then return end
+  local obj, why = Campaign.pick(CampaignData.objectives, campaignState(game), {})
+  if obj then
+    log("campaign: planner would target %s (%s)", obj.id, obj.title or "")
+    ev("objective", { id = obj.id, world = game.currentWorldName })
+  else
+    log("campaign: planner idle (%s)", tostring(why))
+    ev("objective", { id = "none", reason = why or "",
+      world = game.currentWorldName })
+  end
+end
+
 local function handleDialogs(game)
   if not (game.confirmBox and game.confirmBox.isOpen) then
     S.confirmSeen = nil
@@ -4683,6 +4731,7 @@ local function tickWorld(game, player)
     overRoute.path, overRoute.failTarget, overRoute.failWorld = nil, nil, nil
     ferryRoute.goal, ferryRoute.path, ferryRoute.failed = nil, nil, false
     log("world changed: %s (visit %s)", tostring(name), tostring(rec.visited))
+    if CFG.campaign then campaignObserve(game) end
     ev("level_enter", {
       world = name, x = player.position.x, y = player.position.y,
       from = S.lastWorld, dungeon = data and data.dungeonType or "",

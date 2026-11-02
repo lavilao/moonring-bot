@@ -1165,3 +1165,28 @@ siguen en verde (sin regresión en el reloj de veneno/poise/summons):
 - La ejecución de `shoot`/`power` en buildCombatOptions queda deliberadamente
   fuera hasta verificar cómo dispara el juego (bump vs tecla de fuego);
   ofrecer opciones no ejecutables rompería el chooser.
+
+### Test54 — P6: grafo de campaña y planner (`zzbot.campaign` + `campaign_data`)
+
+Octava fase del plan (§4). El planner es puro y testado (11 tests); el
+cableado es observación, no cambio de ruta:
+
+- **`mod/zzbot/campaign_data.lua`**: los 8 objetivos del orden §4.3 (Jest →
+  Garden → Repository → Necropolis → Tower → Lament → Tether → Archon) con
+  `requires`/`done` como descriptores de predicado. Solo los datos que el
+  plan afirma: `dungeon2-01` (Jest, reliquia *inferida*), `dungeon6-06`
+  (Tether), 5 reliquias para Lament/Tether; Garden..Tower van con props
+  marcadas *unverified* para corregir contra el juego sin tocar código.
+- **`mod/zzbot/campaign.lua`**: ready set (no done + requires + no blocked +
+  puerta del final), pick por orden con **readiness gate** (fuerza del build
+  vs difficulty del objetivo → pide preparar, no suicidarse), fallos
+  consecutivos → `blocked` tras N=3 sin atascar el resto, y el Archon es
+  implanable sin `killedGods` (defensa en profundidad sobre la ending gate de
+  Test49). Sin evaluador el planner **falla cerrado**: no puede verificar sus
+  done() → no planifica nada (un test pescó que antes dejaba pasar los
+  objetivos sin requires).
+- **Cableado** (`ZZBOT_CAMPAIGN=1`): en cada cambio de mundo el planner
+  registra `EV|kind=objective` con el objetivo que elegiría, usando
+  `isPropertyNonZero` (con pcall) como evaluador de props. La ruta estricta
+  TOWN_ORDER sigue mandando hasta validar predicados en headless; entonces
+  el switch de ruta es el siguiente paso.
