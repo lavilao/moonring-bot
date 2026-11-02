@@ -4085,42 +4085,53 @@ end
 
 -- Confirm boxes carry meaning in their text. The old handler accepted every
 -- prompt, which approved theft, donations and irreversible trapdoors alike.
-local function classifyConfirm(text)
-  local t = text:lower()
-  local function has(s) return t:find(s, 1, true) ~= nil end
-  if has("do you want to steal") then return "theft" end
-  if has("leave this area") then return "zoom_leave" end
-  if has("forsake your old god") then return "apostasy" end
-  if has("dedicate yourself") then return "dedicate" end
-  if has("tether dungeon") then return "dungeon_tether" end
-  if has("leads to your doom") then return "dungeon_doom" end
-  if has("relic dungeon") or has("relic guardian") then return "dungeon_relic" end
-  if has("the egg") or has("100 floors") or has("final challenge") then
-    return "dungeon_endless"
-  end
-  if has("this is a dungeon") or has("master key") then return "dungeon_mini" end
-  if has("one-way trip") or has("proceed onward") then return "dungeon_arena" end
-  if has("are you sure you wish to enter") then return "dungeon_entry" end
-  if has("return to the surface") or has("title screen") then return "leave" end
-  if has("quit the game") then return "quit" end
-  if has("delete your save") then return "delete" end
-  if has("leap into the void") then return "void" end
-  if has("sacrifice all") or has("pray to") then return "sin" end
-  if has("donation box") then return "donate" end
-  if has("discard") then return "discard" end
-  if has("repair") then return "repair" end
-  return "unknown"
-end
+-- P0 module split (PLAN §0.2): classification and policy live in
+-- zzbot.confirm so tools/test_confirm.lua can exercise them without the game.
+-- The inline fallback below is the pre-split behavior and must be kept in
+-- sync with mod/zzbot/confirm.lua.
+local Confirm = {}
+pcall(function() Confirm = require("zzbot.confirm") end)
 
--- Entry prompts are accepted only when the campaign walked us here: a town's
--- lead sent us to this dungeon, or a descent is already in progress. Anything
--- else (a trapdoor found while exploring, an unknown prompt) declines.
-local function confirmDecision(class, game)
-  if class == "zoom_leave" or class == "dedicate" then return true end
-  if class:sub(1, 8) == "dungeon_" then
-    return S.phase == "to-dungeon" or S.entered == true
+local classifyConfirm, confirmDecision
+if Confirm.classify and Confirm.decide then
+  classifyConfirm = Confirm.classify
+  confirmDecision = function(class)
+    return Confirm.decide(class, { phase = S.phase, entered = S.entered })
   end
-  return false
+else
+  classifyConfirm = function(text)
+    local t = tostring(text or ""):lower()
+    local function has(s) return t:find(s, 1, true) ~= nil end
+    if has("do you want to steal") then return "theft" end
+    if has("leave this area") then return "zoom_leave" end
+    if has("forsake your old god") then return "apostasy" end
+    if has("dedicate yourself") then return "dedicate" end
+    if has("tether dungeon") then return "dungeon_tether" end
+    if has("leads to your doom") then return "dungeon_doom" end
+    if has("relic dungeon") or has("relic guardian") then return "dungeon_relic" end
+    if has("the egg") or has("100 floors") or has("final challenge") then
+      return "dungeon_endless"
+    end
+    if has("this is a dungeon") or has("master key") then return "dungeon_mini" end
+    if has("one-way trip") or has("proceed onward") then return "dungeon_arena" end
+    if has("are you sure you wish to enter") then return "dungeon_entry" end
+    if has("return to the surface") or has("title screen") then return "leave" end
+    if has("quit the game") then return "quit" end
+    if has("delete your save") then return "delete" end
+    if has("leap into the void") then return "void" end
+    if has("sacrifice all") or has("pray to") then return "sin" end
+    if has("donation box") then return "donate" end
+    if has("discard") then return "discard" end
+    if has("repair") then return "repair" end
+    return "unknown"
+  end
+  confirmDecision = function(class)
+    if class == "zoom_leave" or class == "dedicate" then return true end
+    if class:sub(1, 8) == "dungeon_" then
+      return S.phase == "to-dungeon" or S.entered == true
+    end
+    return false
+  end
 end
 
 local function handleDialogs(game)
