@@ -120,6 +120,8 @@ tools/unit.sh test_confirm # uno solo
 | `ZZBOT_MODEL_N` | `64` | Muestras del modelo |
 | `ZZBOT_ALPHA` | `0.08` | Tolerancia de riesgo del modelo |
 | `ZZBOT_HORIZON` | `480` | Horizonte temporal del modelo |
+| `ZZBOT_LEARN` | `0` | `1` = aprender de las muertes (`zzbot.knowledge`): multiplica el daño de los enemigos que nos matan |
+| `ZZBOT_KNOWLEDGE` | – | Ruta del ledger aprendido (por defecto junto al log: `zzbot_knowledge.lua`) |
 | `ZZBOT_SHOT_INTERVAL` | – | Segundos entre capturas (`zzshot-NNN.png`) |
 | `ZZBOT_MAPDUMP` | – | Fichero donde volcar el mapa en cada cambio de mundo/muerte |
 
@@ -161,6 +163,7 @@ tools/unit.sh test_confirm # uno solo
 ```
 mod/zzbot/init.lua     mod (capa de juego, navegación, campaña, dioses, ferry)
 mod/zzbot/model.lua    modelo de combate Monte Carlo
+mod/zzbot/knowledge.lua  ledger aprendido de muertes (bandit Beta por enemigo)
 tools/build.sh         extrae Moonring e inyecta el mod
 tools/fetch-love.sh    descarga LÖVE 11.5
 tools/run.sh           arranca la copia moddeada con guardado aislado
@@ -172,6 +175,23 @@ tools/test_model.lua   simulación/pruebas del modelo
 WORKLOG.md             bitácora de desarrollo (decisiones, tests, bugs)
 analisis.md            notas de mecánicas del juego
 ```
+
+## Aprender de las muertes (experimental)
+
+Con `ZZBOT_LEARN=1` el bot lleva un ledger por tipo de enemigo y banda de
+nivel (`zzbot_knowledge.lua`, junto al log): cada muerte atribuida sube la
+peligrosidad de ese enemigo, cada kill la baja. El multiplicador (limitado a
+[0.5, 4.0] y desactivado hasta tener 5 observaciones) escala SOLO el daño
+entrante que el modelo Monte Carlo usa para decidir si pelear, hacer kite o
+huir — la estrategia no cambia, solo su percepción del riesgo.
+
+- **A/B**: alterna partidas con y sin `ZZBOT_LEARN=1` (mismo guardado base)
+  y compara los eventos `EV|` de `death`/`timeout`. El campo `by=` del evento
+  `death` dice quién mató.
+- **Reiniciar el conocimiento**: borra `zzbot_knowledge.lua`.
+- Segundo nivel planeado: `tools/evolve.lua` — búsqueda evolutiva offline de
+  los knobs del modelo (alpha, horizonte…) usando éxito/muerte como
+  recompensa verificable.
 
 ## Estado actual y limitaciones
 

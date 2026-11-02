@@ -83,6 +83,8 @@ local CFG = {
   dialogue  = (os.getenv("ZZBOT_DIALOGUE") == "1"),
   powers    = (os.getenv("ZZBOT_POWERS") == "1"),
   campaign  = (os.getenv("ZZBOT_CAMPAIGN") == "1"),
+  learn     = (os.getenv("ZZBOT_LEARN") == "1"),
+  knowledgePath = os.getenv("ZZBOT_KNOWLEDGE"),
 }
 
 local S = {
@@ -119,6 +121,16 @@ local S = {
   wrapped = false,
   phase = "boot",
 }
+
+-- Learned threat ledger (P8). Deaths per enemy kind feed a Beta-count bandit
+-- that nudges the combat model's damage numbers. Missing module degrades to
+-- stock behaviour (multiplier 1.0 everywhere).
+pcall(function() S.Knowledge = require("zzbot.knowledge") end)
+
+-- Static data tables shared across subsystems. One top-level local instead of
+-- 26: the main chunk sits against Lua's 200-local ceiling and P6/P7 pushed it
+-- over (the file did not compile under real Lua 5.1/LuaJIT limits).
+local DATA = {}
 
 -- Human log + machine-parseable events (PLAN §0.3). P0 module split: the
 -- implementation lives in zzbot.metrics so tools/test_metrics.lua can verify
@@ -174,6 +186,25 @@ else
   end
 end
 
+-- Load the learned threat ledger once at boot. Without ZZBOT_LEARN the bot
+-- never reads or writes it and every threat multiplier stays exactly 1.0.
+-- Wrapped in do...end: the main chunk is at Lua's 200-local ceiling.
+do
+  if S.Knowledge and CFG.learn then
+    local kpath = CFG.knowledgePath
+    if not kpath and CFG.logpath then
+      kpath = (CFG.logpath:gsub("[^/\\]+$", "")) .. "zzbot_knowledge.lua"
+    end
+    S.Knowledge.init{ path = kpath }
+    local loaded = S.Knowledge.load()
+    local st = S.Knowledge.stats()
+    log("knowledge %s: %d deaths, %d kills, %d enemy kinds",
+      loaded and "loaded" or "fresh", st.deaths, st.kills, st.kinds)
+    ev("knowledge", { state = "on", loaded = loaded and 1 or 0,
+      deaths = st.deaths, kills = st.kills, kinds = st.kinds })
+  end
+end
+
 local function now()
   return love.timer.getTime()
 end
@@ -204,7 +235,7 @@ local function ckey(x, y)
   return y * 10000 + x
 end
 
-local DIRS = {
+DATA.DIRS = {
   { 0, -1 }, { 1, 0 }, { 0, 1 }, { -1, 0 },
 }
 
@@ -278,19 +309,19 @@ local function isBumpableDoorName(name)
   return CCellData.cellIsDoor[name] == true and CCellData.cellChange[name] ~= nil
 end
 
-local BREAKABLE_OBSTACLES = {
+DATA.BREAKABLE_OBSTACLES = {
   crateClosed = true, crateOpen = true,
   barrelClosed = true, barrelOpen = true,
 }
 
 local function isBumpableObstacleName(name)
-  return isBumpableDoorName(name) or BREAKABLE_OBSTACLES[name] == true
+  return isBumpableDoorName(name) or DATA.BREAKABLE_OBSTACLES[name] == true
 end
 
 -- Unopened loot cells: CCellData.cellIsContainer/cellIsChest plus bookshelves,
 -- which are searched by bumping as well. A container is looted when the cell
 -- stops being one of these (chestClosed -> chestOpen, crate -> junk, ...).
-local CONTAINER_CELLS = {
+DATA.CONTAINER_CELLS = {
   sarcophagusClosed = true, weaponRackFull = true, potionShelf = true,
   armourStandFull = true, crateClosed = true, potClosed = true,
   barrelClosed = true, chestClosed = true, chestLocked = true,
@@ -326,7 +357,7 @@ function Loot.fingerprint(game)
       local cell = row[x]
       local data = CCellData and CCellData.cellTypeArray[cell.typeIndex]
       if data and data.isWalkable then walk = walk + 1 end
-      if CONTAINER_CELLS[cellTypeName(cell)] then cont = cont + 1 end
+      if DATA.CONTAINER_CELLS[cellTypeName(cell)] then cont = cont + 1 end
     end
   end
   local function at(action)
@@ -363,7 +394,7 @@ local function outsideStep(game, player, wx, wy)
     local d = math.max(math.abs(cxw - wx), math.abs(cyw - wy))
     if d < bestD then bestD, bestK = d, k end
     if d == 0 then break end
-    for _, dir in ipairs(DIRS) do
+    for _, dir in ipairs(DATA.DIRS) do
       local nx, ny = cx + dir[1], cy + dir[2]
       if map:isPositionInMapXYZeroIndexed(nx, ny) then
         local nk = ckey(nx, ny)
@@ -401,7 +432,7 @@ local function walkAroundStep(game, player, wx, wy)
   local map = game.map
   local sx, sy = toMapXY(game, player.position.x, player.position.y)
   local best, bestD
-  for _, dir in ipairs(DIRS) do
+  for _, dir in ipairs(DATA.DIRS) do
     local mx, my = sx + dir[1], sy + dir[2]
     if map:isPositionInMapXYZeroIndexed(mx, my)
       and isPassableForPath(cellAt(map, mx, my)) then
@@ -474,7 +505,7 @@ local function navSteps(game, player, tx, ty, avoidActors, avoidWeb)
       head = head + 1
       if k == targetK then return parent end
       local cx, cy = k % 10000, math.floor(k / 10000)
-      for _, d in ipairs(DIRS) do
+      for _, d in ipairs(DATA.DIRS) do
         local nx, ny = cx + d[1], cy + d[2]
         if inBounds(map, nx, ny) then
           local nk = ckey(nx, ny)
@@ -586,7 +617,7 @@ local function weightedSteps(game, player, tx, ty, opts)
           end
           if c <= (dist[k] or math.huge) then
             local cx, cy = k % 10000, math.floor(k / 10000)
-            for _, d in ipairs(DIRS) do
+            for _, d in ipairs(DATA.DIRS) do
               local nx, ny = cx + d[1], cy + d[2]
               if inBounds(map, nx, ny) then
                 local nk = ckey(nx, ny)
@@ -636,7 +667,7 @@ end
 
 -- Locked doors are not opened by bumping: the game needs a lockpick (or a
 -- pressure plate / unlock event). doorLocked2 is explicitly unpickable.
-local LOCKED_DOOR_CELLS = { doorLocked = true, gateLocked = true }
+DATA.LOCKED_DOOR_CELLS = { doorLocked = true, gateLocked = true }
 
 local function tryPickLock(game, player, x, y)
   local item = player:findInventoryObjectWithName("lockpick")
@@ -694,7 +725,7 @@ local function findFrontier(game, player)
       head = head + 1
 
       local isFrontier = false
-      for _, d in ipairs(DIRS) do
+      for _, d in ipairs(DATA.DIRS) do
         local nx, ny = cx + d[1], cy + d[2]
         if inBounds(map, nx, ny) then
           if not isKnown(nx, ny) then
@@ -749,7 +780,7 @@ local function moveToward(game, player, tx, ty)
     or travelSteps(game, player, tx, ty, false)
   if steps and steps[1] then
     local nx, ny = px + steps[1].x, py + steps[1].y
-    if LOCKED_DOOR_CELLS[cellTypeName(cellAt(game.map, nx, ny))]
+    if DATA.LOCKED_DOOR_CELLS[cellTypeName(cellAt(game.map, nx, ny))]
       and tryPickLock(game, player, nx, ny) then
       return "moving"
     end
@@ -939,6 +970,13 @@ local function playerProfile(game, player)
     prof.speed = (player.actorData.moveSpeed or 1)
       / math.max(0.1, game:getPlayerTickCostMultiplier() or 1)
   end)
+  -- Player level bands the learned threat ledger (P8). Best-effort: the
+  -- ledger buckets default to level 1 when the game does not expose it.
+  pcall(function()
+    local lv = tonumber(player.level)
+      or (player.actorData and tonumber(player.actorData.level))
+    if lv then prof.level = lv end
+  end)
 
   S.prof, S.profTurn = prof, turn
   return prof
@@ -1075,13 +1113,30 @@ local function enemyWeight(game, a, prof)
   w.ttk = w.hp / math.max(0.05, w.ourDps)
   w.n = math.max(1, math.ceil(w.ttk / math.max(1, prof.attackTime)))
   w.cost = w.dps * (w.n - 1) * prof.attackTime
+  -- Learned threat (P8): past deaths against this kind at this level band
+  -- can contradict the theory numbers above. The multiplier scales only the
+  -- damage we take (all incoming fields plus their derived costs), never our
+  -- outgoing damage. With no ledger, no data, or ZZBOT_LEARN unset, m == 1
+  -- and this block is inert.
+  if S.Knowledge and CFG.learn and (w.hit or 0) > 0 then
+    local m = S.Knowledge.threatMult(w.actorType, prof.level)
+    if m ~= 1 then
+      w.modelHit = (w.modelHit or w.hit) * m
+      w.modelMaxHit = (w.modelMaxHit or w.maxHit) * m
+      w.hit = w.hit * m
+      w.maxHit = w.maxHit * m
+      w.dps = w.hit / math.max(1, w.attackTime)
+      w.cost = w.dps * (w.n - 1) * prof.attackTime
+      w.learned = m
+    end
+  end
   return w
 end
 
 -- Every visible hostile within reach of the current fight, nearest first.
 -- Distance is Manhattan, because movement and melee are four-directional: a
 -- creature on a diagonal is two steps away, not "adjacent".
-local THREAT_RADIUS = 9
+DATA.THREAT_RADIUS = 9
 local function threatList(game, player, prof)
   local list = {}
   for _, a in ipairs(game.actorManager.actorArray) do
@@ -1090,7 +1145,7 @@ local function threatList(game, player, prof)
       local dy = a.position.y - player.position.y
       local dist = math.abs(dx) + math.abs(dy)
       local cheb = math.max(math.abs(dx), math.abs(dy))
-      if cheb <= THREAT_RADIUS then
+      if cheb <= DATA.THREAT_RADIUS then
         local w = enemyWeight(game, a, prof)
         w.dist = dist
         list[#list + 1] = w
@@ -1109,7 +1164,7 @@ end
 -- non-adjacent cell is immune as long as our step is shorter than its step.
 -- `use` and `wait` cost 12 ut (actions.lua), a dagger swing 15, and a wolf
 -- bite 24. Constants below were checked against those sources.
-local CC = {
+DATA.CC = {
   CV = 0.34, Z99 = 2.33, Z95 = 1.65,   -- damage spread, 99%/95% survival z
   C_LS = 12, C_POT = 12, LS_CD = 4,    -- heal action cost / anti-spam window
   LS_FRAC = 0.75, LS_WINDOW = 200, LS_RESERVE = 1,
@@ -1129,7 +1184,7 @@ local function enemyStep(t)
 end
 
 local function canOutrun(t, step)
-  return enemyStep(t) > step + CC.OUT_MARGIN
+  return enemyStep(t) > step + DATA.CC.OUT_MARGIN
 end
 
 -- Player steps needed to open a two-tile gap on something we can outrun.
@@ -1156,9 +1211,9 @@ local function Hreq(list, W, prof)
     local b = math.max(0, math.ceil((W - lead) / t.attackTime))
     local m = t.hit
     mu = mu + b * m
-    var = var + b * (CC.CV * m) ^ 2
+    var = var + b * (DATA.CC.CV * m) ^ 2
   end
-  return mu + CC.Z99 * math.sqrt(var)
+  return mu + DATA.CC.Z99 * math.sqrt(var)
 end
 
 -- Worst-case damage arriving within W ut: each creature at its maximum roll
@@ -1189,7 +1244,7 @@ local function packCost(pack, choke, prof)
     local own = (t.n - 1) * prof.attackTime
     local alive = choke and own or (elapsed + own)
     cost = cost + t.dps * alive
-    var = var + (alive / t.attackTime) * (CC.CV * t.hit) ^ 2
+    var = var + (alive / t.attackTime) * (DATA.CC.CV * t.hit) ^ 2
     elapsed = elapsed + t.n * prof.attackTime
   end
   return cost, math.sqrt(var)
@@ -1200,11 +1255,11 @@ local function potionInfo(player)
   local n, best = 0, 0
   if minor and (minor.count or 0) > 0 then
     n = n + minor.count
-    best = math.max(best, CC.POT_MINOR)
+    best = math.max(best, DATA.CC.POT_MINOR)
   end
   if major and (major.count or 0) > 0 then
     n = n + major.count
-    best = math.max(best, CC.POT_MAJOR)
+    best = math.max(best, DATA.CC.POT_MAJOR)
   end
   return n, best
 end
@@ -1219,10 +1274,10 @@ local function verdict(pack, hp, nPot, lsAvail, prof, deadEnd)
     for _, t in ipairs(pack) do
       D = choke and math.max(D, t.dps) or (D + t.dps)
     end
-    return cost + CC.Z95 * sigma + (#pack + 1) * D * CC.C_LS
+    return cost + DATA.CC.Z95 * sigma + (#pack + 1) * D * DATA.CC.C_LS
   end
-  local res = hp + nPot * CC.POT_EFF
-    + math.min(math.max(#pack - 1, 0), math.max(0, lsAvail)) * CC.LS_WINDOW
+  local res = hp + nPot * DATA.CC.POT_EFF
+    + math.min(math.max(#pack - 1, 0), math.max(0, lsAvail)) * DATA.CC.LS_WINDOW
   local chokeNeed = need(true)
   if #pack == 1 then
     return chokeNeed <= res and "open" or "avoid", chokeNeed, res
@@ -1264,7 +1319,7 @@ local function findFleeCell(game, player)
         -- kited one wolf straight into the wasp nest. Each unknown neighbour
         -- adds a step of cost, so known-safe cells win when they exist.
         local unknown = 0
-        for _, d in ipairs(DIRS) do
+        for _, d in ipairs(DATA.DIRS) do
           local ux, uy = cx + d[1], cy + d[2]
           if inBounds(game.map, ux, uy) and not isKnown(ux, uy) then
             unknown = unknown + 1
@@ -1277,13 +1332,13 @@ local function findFleeCell(game, player)
       end
     end
     if cd < 11 then
-      for _, d in ipairs(DIRS) do
+      for _, d in ipairs(DATA.DIRS) do
         local nx, ny = cx + d[1], cy + d[2]
         if inBounds(game.map, nx, ny) then
           local nk = ckey(nx, ny)
           local cell = cellAt(game.map, nx, ny)
           if not seen[nk] and not blocked[nk]
-            and not (CC.WEB and cellTypeName(cell) == "web")
+            and not (DATA.CC.WEB and cellTypeName(cell) == "web")
             and isPassableForPath(cell) then
             seen[nk] = true
             queue[#queue + 1] = { nx, ny, cd + 1 }
@@ -1303,13 +1358,13 @@ local function desperateEscapeCell(game, player)
   local blocked = visibleHostileCells(game, player)
   local px, py = playerPos(player)
   local best, bestScore
-  for _, d in ipairs(DIRS) do
+  for _, d in ipairs(DATA.DIRS) do
     local nx, ny = px + d[1], py + d[2]
     if inBounds(game.map, nx, ny) then
       local nk = ckey(nx, ny)
       local cell = cellAt(game.map, nx, ny)
       if not blocked[nk]
-        and not (CC.WEB and cellTypeName(cell) == "web")
+        and not (DATA.CC.WEB and cellTypeName(cell) == "web")
         and isPassableForPath(cell) then
         local nearest = 999
         for key in pairs(blocked) do
@@ -1328,7 +1383,7 @@ end
 
 local function passableNeighbourCount(game, x, y)
   local n = 0
-  for _, d in ipairs(DIRS) do
+  for _, d in ipairs(DATA.DIRS) do
     local nx, ny = x + d[1], y + d[2]
     if inBounds(game.map, nx, ny) and isPassableForPath(cellAt(game.map, nx, ny)) then
       n = n + 1
@@ -1365,11 +1420,11 @@ local function tryHeal(game, player)
   local wand = findLifestone(player)
   local charges = lsUses(wand)
   local nPot, bestPot = potionInfo(player)
-  local reserve = S.exitReady and 0 or CC.LS_RESERVE
+  local reserve = S.exitReady and 0 or DATA.CC.LS_RESERVE
   local lsReady = charges > 0
-    and ((gGameTurn or 0) - (S.lastLSTurn or -1000)) >= CC.LS_CD
+    and ((gGameTurn or 0) - (S.lastLSTurn or -1000)) >= DATA.CC.LS_CD
 
-  local Gp = math.min(math.floor(maxhp * CC.LS_FRAC), missing)
+  local Gp = math.min(math.floor(maxhp * DATA.CC.LS_FRAC), missing)
   local Ge = (#adj > 0) and adjacentHealTotal(game, player) or 0
   local D, lamMax, mNear = 0, 0, 0
   for _, w in ipairs(adj) do
@@ -1378,18 +1433,18 @@ local function tryHeal(game, player)
   end
   for _, w in ipairs(near) do mNear = math.max(mNear, w.hit) end
 
-  local dM_ls = Gp - lamMax * Ge - D * CC.C_LS
-  local dM_pot = math.min(bestPot, missing) - D * CC.C_POT
+  local dM_ls = Gp - lamMax * Ge - D * DATA.CC.C_LS
+  local dM_pot = math.min(bestPot, missing) - D * DATA.CC.C_POT
   -- Only what can reach us right now makes this an emergency: enemies still
   -- walking in belong to the pack verdict and travel model, not to a heal
   -- spent while they close the gap for free.
   local poise = math.max(0, player.poise or 0)
-  local lethal = poise <= 0 and hp <= lethalBound(adj, CC.C_LS)
+  local lethal = poise <= 0 and hp <= lethalBound(adj, DATA.CC.C_LS)
   local emergency = #adj > 0
-    and ((hp + poise) <= Hreq(adj, CC.C_LS, prof) or lethal)
+    and ((hp + poise) <= Hreq(adj, DATA.CC.C_LS, prof) or lethal)
   local lsOK = lsReady and (charges > reserve or emergency)
   local cdSafe = (#adj == 0)
-    or (hp + Gp - D * (CC.C_LS + CC.LS_CD * prof.attackTime)
+    or (hp + Gp - D * (DATA.CC.C_LS + DATA.CC.LS_CD * prof.attackTime)
         >= Hreq(adj, prof.attackTime, prof))
 
   -- Unless the next bite ends us, killing an attacker that dies to one swing
@@ -1405,15 +1460,15 @@ local function tryHeal(game, player)
     -- alive: top up to 300 before moving toward the stairs. Before that
     -- point the run still has looting and fighting ahead, so charges stay
     -- reserved for emergencies.
-    if S.exitReady and #adj == 0 and hp < CC.POSTKEY_HP then
+    if S.exitReady and #adj == 0 and hp < DATA.CC.POSTKEY_HP then
       if lsReady and charges > 0 then return useLS(game, player, wand, "post-key") end
       if nPot > 0 and missing >= 150 then return drinkPotion(game, player) end
       return false
     end
     -- A clean window (nothing adjacent, or the adjacent creature is at full
     -- health) makes the heal free. No threat at all demands a full half charge.
-    local dmMin = (#near > 0) and mNear or CC.DM_PEACE
-    if lsOK and Gp >= CC.MIN_GE_HEAL and dM_ls >= dmMin and cdSafe then
+    local dmMin = (#near > 0) and mNear or DATA.CC.DM_PEACE
+    if lsOK and Gp >= DATA.CC.MIN_GE_HEAL and dM_ls >= dmMin and cdSafe then
       return useLS(game, player, wand, "clean window")
     end
     return false
@@ -1431,7 +1486,7 @@ local function tryHeal(game, player)
   end
   -- If the next blow ends the run, the only question is whether this heal
   -- lifts us above it; what the enemy regains buys it a swing, not the fight.
-  if lsOK and lethal and hp + Gp > lethalBound(adj, CC.C_LS) then
+  if lsOK and lethal and hp + Gp > lethalBound(adj, DATA.CC.C_LS) then
     return useLS(game, player, wand, "lethal cover")
   end
   return false
@@ -1485,7 +1540,7 @@ local function combatDiag(game, player, prof, threats)
   for _, w in ipairs(threats) do
     incoming = incoming + w.dps
     if w.dist <= 1 then adj[#adj + 1] = w end
-    if w.dist <= 6 or (w.aware and w.dist <= THREAT_RADIUS) then
+    if w.dist <= 6 or (w.aware and w.dist <= DATA.THREAT_RADIUS) then
       near[#near + 1] = w
     end
     parts[#parts + 1] = string.format("%s@%d,%d hp=%d d=%d dps=%.1f n=%d def=%.2f%s%s",
@@ -1496,7 +1551,7 @@ local function combatDiag(game, player, prof, threats)
   local nPot = potionInfo(player)
   local wand = findLifestone(player)
   local lsCharges = lsUses(wand)
-  local reserve = S.exitReady and 0 or CC.LS_RESERVE
+  local reserve = S.exitReady and 0 or DATA.CC.LS_RESERVE
   local v, need, res = "none", 0, 0
   if #near > 0 then
     local deadEnd = passableNeighbourCount(game, player.position.x, player.position.y) <= 1
@@ -1507,8 +1562,8 @@ local function combatDiag(game, player, prof, threats)
     player.health, player.maxHealth, math.floor(player.poise or 0),
     playerStep(prof), prof.dps, prof.hit,
     math.floor(Hreq(near, prof.attackTime, prof)),
-    math.floor(Hreq(near, CC.C_LS, prof)),
-    math.floor(lethalBound(near, CC.C_LS)),
+    math.floor(Hreq(near, DATA.CC.C_LS, prof)),
+    math.floor(lethalBound(near, DATA.CC.C_LS)),
     incoming, v, math.floor(need), math.floor(res), table.concat(parts, " "))
 end
 
@@ -1517,7 +1572,7 @@ end
 -- attacker can stand next to us at a time, even if a retreat exit remains.
 local function chokeInfo(game, x, y, threats)
   local open, approach = 0, 0
-  for _, d in ipairs(DIRS) do
+  for _, d in ipairs(DATA.DIRS) do
     local nx, ny = x + d[1], y + d[2]
     if inBounds(game.map, nx, ny) and isPassableForPath(cellAt(game.map, nx, ny)) then
       open = open + 1
@@ -1574,13 +1629,13 @@ local function findRetreatCell(game, player)
     end
 
     if cd < 8 then
-      for _, d in ipairs(DIRS) do
+      for _, d in ipairs(DATA.DIRS) do
         local nx, ny = cx + d[1], cy + d[2]
         if inBounds(game.map, nx, ny) then
           local nk = ckey(nx, ny)
           local cell = cellAt(game.map, nx, ny)
           if not seen[nk] and not blocked[nk]
-            and not (CC.WEB and cellTypeName(cell) == "web")
+            and not (DATA.CC.WEB and cellTypeName(cell) == "web")
             and isPassableForPath(cell) then
             seen[nk] = true
             queue[#queue + 1] = { nx, ny, cd + 1 }
@@ -1636,7 +1691,7 @@ local function kiteHealOK(game, player, prof, near, step)
   end
   if need <= 0 then return false end
   local remaining = math.max(0,
-    CC.LS_CD - ((gGameTurn or 0) - (S.lastLSTurn or -1000)))
+    DATA.CC.LS_CD - ((gGameTurn or 0) - (S.lastLSTurn or -1000)))
   if remaining > need then return false end
   local cell = findFleeCell(game, player)
   if not cell then return false end
@@ -1737,20 +1792,20 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
   if nPot > 0 and missing > 0 then
     actions[#actions + 1] = {
       kind = "heal", item = "potion",
-      healAmount = math.min(bestPot, missing), time = CC.C_POT,
+      healAmount = math.min(bestPot, missing), time = DATA.CC.C_POT,
       label = "potion", resourceCost = 0.55 * val,
     }
   end
 
   local lsReady = charges > 0
-    and ((gGameTurn or 0) - (S.lastLSTurn or -1000)) >= CC.LS_CD
+    and ((gGameTurn or 0) - (S.lastLSTurn or -1000)) >= DATA.CC.LS_CD
   -- A heal with nothing to heal still costs a full use turn, so it must never
   -- appear as an option (it was picked five times at full health in test24).
-  local Gp = math.min(math.floor(maxhp * CC.LS_FRAC), missing)
+  local Gp = math.min(math.floor(maxhp * DATA.CC.LS_FRAC), missing)
   if lsReady and Gp > 0 then
     actions[#actions + 1] = {
       kind = "heal", item = "lifestone", healAmount = Gp,
-      enemyHeals = adjacentHealMap(pack, player, Gp), time = CC.C_LS,
+      enemyHeals = adjacentHealMap(pack, player, Gp), time = DATA.CC.C_LS,
       label = "lifestone", resourceCost = 0.32 * val,
     }
   end
@@ -2000,7 +2055,7 @@ local function combatStep(game, player)
     -- An awake creature within detection range is coming to us whether we
     -- walk past it or not, so it belongs in the fight's cost, not just in the
     -- threat list. Unaware ones further than six steps are ignored.
-    if w.dist <= 6 or (w.aware and w.dist <= THREAT_RADIUS) then
+    if w.dist <= 6 or (w.aware and w.dist <= DATA.THREAT_RADIUS) then
       near[#near + 1] = w
     end
   end
@@ -2018,8 +2073,8 @@ local function combatStep(game, player)
   end
   local poise = math.max(0, player.poise or 0)
   local emergency = #adj > 0
-    and ((player.health + poise) <= Hreq(adj, CC.C_LS, prof)
-      or (poise <= 0 and player.health <= lethalBound(adj, CC.C_LS)))
+    and ((player.health + poise) <= Hreq(adj, DATA.CC.C_LS, prof)
+      or (poise <= 0 and player.health <= lethalBound(adj, DATA.CC.C_LS)))
 
   local function bump(t)
     pressDelta(t.actor.position.x - px, t.actor.position.y - py)
@@ -2042,7 +2097,7 @@ local function combatStep(game, player)
   local nPot, bestPot = potionInfo(player)
   local wand = findLifestone(player)
   local charges = lsUses(wand)
-  local reserve = S.exitReady and 0 or CC.LS_RESERVE
+  local reserve = S.exitReady and 0 or DATA.CC.LS_RESERVE
   local v = verdict(near, player.health + poise, nPot,
     math.max(0, charges - reserve), prof, deadEnd)
   local fleeWanted = S.exitReady or v == "avoid"
@@ -2251,13 +2306,13 @@ end
 -- Campaign progression (guide order). Each town owns the dungeon in its
 -- leadsTo field; clearing that dungeon returns us to the town, and the next
 -- entry in this order becomes the travel target on the overworld.
-local TOWN_ORDER = {
+DATA.TOWN_ORDER = {
   "Yarrow", "Moon-upon-Thoss", "Barrow-Linn", "Harrowdus",
   "Hearthaven", "Wintersholl", "The_Red_Grove",
 }
 
 local function townIndex(name)
-  for i, n in ipairs(TOWN_ORDER) do
+  for i, n in ipairs(DATA.TOWN_ORDER) do
     if n == name then return i end
   end
   return nil
@@ -2269,7 +2324,7 @@ end
 -- visit list is filtered against the achievements stored in the save so a
 -- restart never repeats a paid visit; it only gates dedication and logging,
 -- it never reorders the campaign or delays a dungeon.
-local TOUR_TOWNS = {
+DATA.TOUR_TOWNS = {
   { town = "Barrow-Linn",   ach = "homeTown3" },  -- lordsOfDust
   { town = "Harrowdus",     ach = "homeTown2" },  -- deathsHarlequin
   { town = "Hearthaven",    ach = "homeTown5" },  -- blindAngels
@@ -2281,7 +2336,7 @@ local function tourPending(game)
   if not CFG.tour then return nil end
   if S.tourPending == nil then
     S.tourPending = {}
-    for _, t in ipairs(TOUR_TOWNS) do
+    for _, t in ipairs(DATA.TOUR_TOWNS) do
       local done = false
       pcall(function()
         local ach = game:getAchievements()
@@ -2322,7 +2377,7 @@ local function fleeZoneCell(game, player)
       return { x = cx, y = cy }
     end
     if cd < 80 then
-      for _, d in ipairs(DIRS) do
+      for _, d in ipairs(DATA.DIRS) do
         local nx, ny = cx + d[1], cy + d[2]
         if inBounds(map, nx, ny) and not seen[ckey(nx, ny)]
           and cellWalkable(cellAt(map, nx, ny)) then
@@ -2402,7 +2457,7 @@ local function overworldPath(game, sx, sy, tx, ty)
     local k = queue[head]
     head = head + 1
     local cx, cy = k % 4096, math.floor(k / 4096)
-    for _, d in ipairs(DIRS) do
+    for _, d in ipairs(DATA.DIRS) do
       local nx, ny = cx + d[1], cy + d[2]
       if nx >= 0 and ny >= 0 and nx < w and ny < h then
         local nk = ny * 4096 + nx
@@ -2486,8 +2541,8 @@ end
 -- (the mainland gate) with the little dock town beside Barrow-Linn. When no
 -- land route exists, walk to the gate for the outbound crossing or to the dock
 -- for the free return, and press Return there to enter the town that sails.
-local FERRY_DOCK = { x = 192, y = 292 }
-local FERRY_GATE = { x = 248, y = 244 }
+DATA.FERRY_DOCK = { x = 192, y = 292 }
+DATA.FERRY_GATE = { x = 248, y = 244 }
 local ferryRoute = { target = nil, world = nil, goal = nil, path = nil,
   failed = false }
 
@@ -2501,14 +2556,14 @@ local function ferryLegStep(game, player, target)
   if ferryRoute.failed then return nil end
   if not (ferryRoute.goal and ferryRoute.path) then
     ferryRoute.goal, ferryRoute.path = nil, nil
-    local dock = overworldPath(game, px, py, FERRY_DOCK.x, FERRY_DOCK.y)
+    local dock = overworldPath(game, px, py, DATA.FERRY_DOCK.x, DATA.FERRY_DOCK.y)
     if dock then
-      ferryRoute.goal, ferryRoute.path = FERRY_DOCK, dock
+      ferryRoute.goal, ferryRoute.path = DATA.FERRY_DOCK, dock
       log("travel: ferry leg to the Barrow-Linn dock (%d steps)", #dock)
     elseif target == "Barrow-Linn" then
-      local gate = overworldPath(game, px, py, FERRY_GATE.x, FERRY_GATE.y)
+      local gate = overworldPath(game, px, py, DATA.FERRY_GATE.x, DATA.FERRY_GATE.y)
       if gate then
-        ferryRoute.goal, ferryRoute.path = FERRY_GATE, gate
+        ferryRoute.goal, ferryRoute.path = DATA.FERRY_GATE, gate
         log("travel: ferry leg to the Moon-upon-Thoss gate (%d steps)", #gate)
       end
     end
@@ -2627,11 +2682,11 @@ local function doorTriggerAt(game, x, y, action)
     game.currentWorldName, wx, wy, action)
 end
 
-local LOCKED_DOOR_NAMES = { doorLocked = true, gateLocked = true, doorLocked2 = true }
+DATA.LOCKED_DOOR_NAMES = { doorLocked = true, gateLocked = true, doorLocked2 = true }
 
 local function lockedDoorPlan(game, player, x, y)
   local name = cellTypeName(cellAt(game.map, x, y))
-  if not LOCKED_DOOR_NAMES[name] then return nil end
+  if not DATA.LOCKED_DOOR_NAMES[name] then return nil end
   if player:findInventoryObjectWithName("key_master") then return nil end
   local t = doorTriggerAt(game, x, y, "locked_door")
   if not t then
@@ -2664,7 +2719,7 @@ local function findRoutableDoor(game, player)
     local cx, cy = queue[head][1], queue[head][2]
     head = head + 1
 
-    for _, d in ipairs(DIRS) do
+    for _, d in ipairs(DATA.DIRS) do
       local nx, ny = cx + d[1], cy + d[2]
       if inBounds(map, nx, ny) and isKnown(nx, ny) then
         local neighbour = cellAt(map, nx, ny)
@@ -2695,7 +2750,7 @@ end
 -- Secret doors look like walls until bumped. The game raises
 -- game.gotFeelingAboutSecretDoor when the player stands next to one, so when
 -- exploration stalls we sweep the neighbouring walls (a few per second).
-local DANGEROUS_BUMP = {
+DATA.DANGEROUS_BUMP = {
   lava = true, staticFire = true, fire = true, void = true,
   sea = true, deepSea = true, water = true, deepWater = true,
 }
@@ -2703,13 +2758,13 @@ local DANGEROUS_BUMP = {
 local function trySecretDoorSweep(game, player)
   if not game.gotFeelingAboutSecretDoor then return false end
   local px, py = playerPos(player)
-  for _, d in ipairs(DIRS) do
+  for _, d in ipairs(DATA.DIRS) do
     local nx, ny = px + d[1], py + d[2]
     if inBounds(game.map, nx, ny) then
       local cell = cellAt(game.map, nx, ny)
       local name = cellTypeName(cell)
       if name and not cellWalkable(cell) and not isBumpableObstacleName(name)
-        and not DANGEROUS_BUMP[name] then
+        and not DATA.DANGEROUS_BUMP[name] then
         local k = ckey(nx, ny)
         local t = now()
         if t - (S.sweptAt[k] or -100) > 3 then
@@ -2889,7 +2944,7 @@ function Loot.scan(game)
     local row = map.cells[y]
     for x = 1, map.width do
       local nm = cellTypeName(row[x])
-      if nm and CONTAINER_CELLS[nm] then
+      if nm and DATA.CONTAINER_CELLS[nm] then
         local mx, my = x - 1, y - 1
         local k = ckey(mx, my)
         local c = rec.containers[k]
@@ -2913,7 +2968,7 @@ function Loot.lockedAhead(game, px, py, steps)
   local s = steps and steps[1]
   if not s then return false end
   local nm = cellTypeName(cellAt(game.map, px + s.x, py + s.y))
-  return LOCKED_DOOR_NAMES[nm] == true
+  return DATA.LOCKED_DOOR_NAMES[nm] == true
 end
 
 function Loot.sweepStep(game, player)
@@ -2925,7 +2980,7 @@ function Loot.sweepStep(game, player)
   for _, c in pairs(rec.containers) do
     if c.state == "pending" then
       local nm = cellTypeName(cellAt(game.map, c.x, c.y))
-      if not nm or not CONTAINER_CELLS[nm] then
+      if not nm or not DATA.CONTAINER_CELLS[nm] then
         c.state = "done"
         c.problem = nil
         ev("container_open", { world = name, x = c.x, y = c.y, was = c.cell, now = nm })
@@ -3146,10 +3201,10 @@ end
 -- Yarrow has two Large Healing Potions lying around (a crate at 34,64 and an
 -- object at 31,45). They are the difference between losing and winning the
 -- silverwolf fight, so grab them before heading to the cave.
-local TOWN_SUPPLIES = { "potion_heal_major", "potion_heal" }
+DATA.TOWN_SUPPLIES = { "potion_heal_major", "potion_heal" }
 
 local function townSupplyStep(game, player)
-  for _, name in ipairs(TOWN_SUPPLIES) do
+  for _, name in ipairs(DATA.TOWN_SUPPLIES) do
     local list = game.triggerData:getAllTriggersOnLevelWithActionName(
       game.currentWorldName, "object") or {}
     for _, t in ipairs(list) do
@@ -3160,7 +3215,7 @@ local function townSupplyStep(game, player)
       end
     end
   end
-  for _, name in ipairs(TOWN_SUPPLIES) do
+  for _, name in ipairs(DATA.TOWN_SUPPLIES) do
     local list = game.triggerData:getAllTriggersOnLevelWithActionName(
       game.currentWorldName, "container") or {}
     for _, t in ipairs(list) do
@@ -3301,18 +3356,18 @@ end
 -- shop. Keep the best gear and a consumable reserve; once the purse is
 -- comfortable, hold goods this town dislikes so a later stop pays more for
 -- them (the same demand mechanic that makes local prices swing 2x).
-local SELL_KEEP_CATEGORY = { key = true, quest = true, deed = true, lamp = true,
+DATA.SELL_KEEP_CATEGORY = { key = true, quest = true, deed = true, lamp = true,
   scroll = true, wand = true, artifact = true }
-local WEAR_SLOTS = { melee = true, ranged = true, head = true, body = true,
+DATA.WEAR_SLOTS = { melee = true, ranged = true, head = true, body = true,
   hands = true, feet = true, neck = true, cloak = true, shield = true }
-local SELL_RESERVE = {
+DATA.SELL_RESERVE = {
   potion_heal_major = 2, potion_heal = 2, potion_cureall = 1,
   potion_oil = 1, kindling = 3,
 }
-local CATEGORY_RESERVE = { food = 3, potion = 2, ointment = 2, medicine = 2, oil = 1 }
+DATA.CATEGORY_RESERVE = { food = 3, potion = 2, ointment = 2, medicine = 2, oil = 1 }
 -- Never restock the bag with things the combat layer will consume or that
 -- sellPlan keeps forever: the unit cost tag would leak or the money is lost.
-local TRADE_SKIP = {
+DATA.TRADE_SKIP = {
   potion_heal = true, potion_heal_major = true,
   camp_kit = true, wand_of_healing = true,
 }
@@ -3386,7 +3441,7 @@ end
 local function bestGearIDs(game, inv)
   local best, ids = {}, {}
   for _, o in pairs(inv or {}) do
-    if WEAR_SLOTS[o.category] then
+    if DATA.WEAR_SLOTS[o.category] then
       local value = objBasePrice(game, o)
       if value > 0 and (not best[o.category] or value > best[o.category]) then
         best[o.category] = value
@@ -3448,7 +3503,7 @@ local function equipStep(game, player)
   local inv = player.inventory or {}
   local records, worn = {}, {}
   for _, o in pairs(inv) do
-    if WEAR_SLOTS[o.category] then
+    if DATA.WEAR_SLOTS[o.category] then
       local r = gearRecord(game, o)
       if r then
         records[#records + 1] = r
@@ -3499,8 +3554,8 @@ end
 -- P2 lamp basics (PLAN §3.9), behind ZZBOT_LAMP=1. The fuel object names are
 -- an open question (§8): with these defaults a wrong name is a silent no-op
 -- and a real lamp still toggles through the game's own inventory API.
-local LAMP_TYPES = { lamp = true }
-local FUEL_TYPES = { lamp_oil = true, oil_flask = true }
+DATA.LAMP_TYPES = { lamp = true }
+DATA.FUEL_TYPES = { lamp_oil = true, oil_flask = true }
 local function lampStep(game, player)
   if not CFG.lamp or not (Gear and Gear.lampPlan) then return false end
   local allowAmber = true
@@ -3511,8 +3566,8 @@ local function lampStep(game, player)
   end)
   local lamp, fuel
   for _, o in pairs(player.inventory or {}) do
-    if LAMP_TYPES[o.objectType] then lamp = o end
-    if FUEL_TYPES[o.objectType] then fuel = (fuel or 0) + (o.count or 1) end
+    if DATA.LAMP_TYPES[o.objectType] then lamp = o end
+    if DATA.FUEL_TYPES[o.objectType] then fuel = (fuel or 0) + (o.count or 1) end
   end
   local plan = Gear.lampPlan({
     allowAmber = allowAmber, hasLamp = lamp ~= nil, fuel = fuel or 0,
@@ -3546,7 +3601,7 @@ end
 
 -- How many units of this object the bot is willing to part with right now.
 local function sellPlan(game, o, money, gearIDs, rangedOwned)
-  if SELL_KEEP_CATEGORY[o.category] then return false end
+  if DATA.SELL_KEEP_CATEGORY[o.category] then return false end
   if o.objectType == "wand_of_healing" or o.objectType == "camp_kit" then
     return false
   end
@@ -3563,21 +3618,21 @@ local function sellPlan(game, o, money, gearIDs, rangedOwned)
   end
   local count = o.count or 1
   local sellable
-  if WEAR_SLOTS[o.category] then
+  if DATA.WEAR_SLOTS[o.category] then
     if gearIDs[o.ID] then return false end
     sellable = count
   elseif o.category == "ammo" then
     if rangedOwned then return false end
     sellable = count
   elseif o.category == "tool" then
-    local reserve = SELL_RESERVE[o.objectType]
+    local reserve = DATA.SELL_RESERVE[o.objectType]
     if not reserve then return false end
     sellable = count - reserve
   elseif o.category == "trade" or o.category == "reagent"
     or o.category == "base" or o.category == "alchemy" then
     sellable = count
   else
-    sellable = count - (SELL_RESERVE[o.objectType] or CATEGORY_RESERVE[o.category] or 0)
+    sellable = count - (DATA.SELL_RESERVE[o.objectType] or DATA.CATEGORY_RESERVE[o.category] or 0)
   end
   if sellable <= 0 then return false end
   -- Demand exploit: with money in the purse, wait for a town that wants the
@@ -3626,7 +3681,7 @@ local function walkNextToActor(game, player, actor)
   local map = game.map
   local ax, ay = actor.position.x, actor.position.y
   local best, bestLen
-  for _, d in ipairs(DIRS) do
+  for _, d in ipairs(DATA.DIRS) do
     local nx, ny = ax + d[1], ay + d[2]
     if inBounds(map, nx, ny) and cellWalkable(cellAt(map, nx, ny)) then
       local steps = travelSteps(game, player, nx, ny)
@@ -3807,8 +3862,8 @@ local function tradeCandidates(game)
           local def
           pcall(function() def = game:getObjectDataWithObjectType(entry.ID) end)
           if def and (tonumber(def.price) or 0) > 0
-            and not SELL_KEEP_CATEGORY[def.category]
-            and not TRADE_SKIP[def.objectType] then
+            and not DATA.SELL_KEEP_CATEGORY[def.category]
+            and not DATA.TRADE_SKIP[def.objectType] then
             -- Potions, wands and berries carry no burden at all (weight 0);
             -- they are the best trade goods, so 0 must mean "fits freely".
             local w = tonumber(def.weight) or 0
@@ -3817,7 +3872,7 @@ local function tradeCandidates(game)
               pcall(function() buyPrice = game.economy:getActualBuyValue(def) end)
               if buyPrice > 0 then
                 local sellTown, sellPrice
-                for _, town in ipairs(TOWN_ORDER) do
+                for _, town in ipairs(DATA.TOWN_ORDER) do
                   if town ~= loc then
                     local v = sellValueInTown(game, town, def)
                     if v > 0 and (not sellPrice or v > sellPrice) then
@@ -3917,7 +3972,7 @@ local function tradeDump(game)
             pcall(function() buyPrice = game.economy:getActualBuyValue(def) end)
             if buyPrice > 0 then
               local sellTown, sellPrice
-              for _, town in ipairs(TOWN_ORDER) do
+              for _, town in ipairs(DATA.TOWN_ORDER) do
                 if town ~= loc then
                   local v = sellValueInTown(game, town, def)
                   if v > 0 and (not sellPrice or v > sellPrice) then
@@ -4013,7 +4068,7 @@ end
 -- Dust). Shops sell exactly fifteen potion/ointment types between them, so one
 -- unit of each unknown type is a guaranteed two Devotion, and the three wand
 -- types restocked everywhere start the slower wand task.
-local DISCOVERY_TIER = { potion = 1, ointment = 1, wand = 2 }
+DATA.DISCOVERY_TIER = { potion = 1, ointment = 1, wand = 2 }
 
 local function achievementsModule()
   if S.ach then return S.ach end
@@ -4047,7 +4102,7 @@ local function discoveryCandidates(game)
         if (entry.amount or 0) > 0 and not skip and not (seen and seen > 0) then
           local def
           pcall(function() def = game:getObjectDataWithObjectType(entry.ID) end)
-          local tier = def and DISCOVERY_TIER[tostring(def.category):lower()]
+          local tier = def and DATA.DISCOVERY_TIER[tostring(def.category):lower()]
           if tier then
             local buyPrice = 0
             pcall(function() buyPrice = game.economy:getActualBuyValue(def) end)
@@ -4169,7 +4224,7 @@ end
 -- text at the same spot is not progress: its timer survives short gaps, which
 -- is how the "grievance" alert freeze shows up (bot presses Return on the exit
 -- every tick, the alert closes and is immediately re-triggered).
-local WD = {
+DATA.WD = {
   sig = nil, since = 0, lastLog = 0,
   dialogKey = nil, dialogAt = 0, dialogStage = 0, gapAt = nil,
 }
@@ -4210,17 +4265,17 @@ local function watchdog(game, player)
   local name, box = openDialog(game)
 
   if name then
-    WD.gapAt = nil
+    DATA.WD.gapAt = nil
     local sig = dialogSignature(game, player, name, box)
-    if sig ~= WD.dialogKey then
-      WD.dialogKey, WD.dialogAt, WD.dialogStage = sig, t, 0
+    if sig ~= DATA.WD.dialogKey then
+      DATA.WD.dialogKey, DATA.WD.dialogAt, DATA.WD.dialogStage = sig, t, 0
     end
-    local idle = t - WD.dialogAt
+    local idle = t - DATA.WD.dialogAt
     if idle < 6 then return false end
 
     local stage = math.min(4, 1 + math.floor((idle - 6) / 4))
-    if stage <= WD.dialogStage then return false end
-    WD.dialogStage = stage
+    if stage <= DATA.WD.dialogStage then return false end
+    DATA.WD.dialogStage = stage
     local text = dialogText(box)
     local fields = {
       world = game.currentWorldName, x = player.position.x, y = player.position.y,
@@ -4274,10 +4329,10 @@ local function watchdog(game, player)
 
   -- Give a closed dialog two seconds to reopen with the same signature before
   -- forgetting it, so a close/reopen loop keeps accumulating idle time.
-  if WD.dialogKey then
-    WD.gapAt = WD.gapAt or t
-    if t - WD.gapAt > 2 then
-      WD.dialogKey, WD.dialogAt, WD.dialogStage, WD.gapAt = nil, t, 0, nil
+  if DATA.WD.dialogKey then
+    DATA.WD.gapAt = DATA.WD.gapAt or t
+    if t - DATA.WD.gapAt > 2 then
+      DATA.WD.dialogKey, DATA.WD.dialogAt, DATA.WD.dialogStage, DATA.WD.gapAt = nil, t, 0, nil
     end
   end
 
@@ -4288,13 +4343,13 @@ local function watchdog(game, player)
     tostring(gGameTurn), tostring(player.health),
     tostring(ps and ps.money), tostring(#(player.inventory or {})),
   }, "|")
-  if sig ~= WD.sig then
-    WD.sig, WD.since = sig, t
+  if sig ~= DATA.WD.sig then
+    DATA.WD.sig, DATA.WD.since = sig, t
     return false
   end
-  local idle = t - WD.since
-  if idle > 20 and t - WD.lastLog > 10 then
-    WD.lastLog = t
+  local idle = t - DATA.WD.since
+  if idle > 20 and t - DATA.WD.lastLog > 10 then
+    DATA.WD.lastLog = t
     log("watchdog: no progress for %.0fs at %s %d,%d phase=%s",
       idle, tostring(game.currentWorldName), player.position.x, player.position.y,
       tostring(S.phase))
@@ -4364,10 +4419,10 @@ end
 -- press-Return behavior.
 -- Typed-input keywords the campaign needs (PLAN §4.1). The DialogueData CSV
 -- parsing lands with the campaign work; this list is hand-authored for now.
-local DIALOGUE_KEYWORDS = { "Death_Has_Dominion_Over_All" }
+DATA.DIALOGUE_KEYWORDS = { "Death_Has_Dominion_Over_All" }
 -- Nothing is accepted until the prompt keys are verified (§8.5): the safe
 -- default in zzbot.dialogue is decline.
-local DIALOGUE_YESNO = {}
+DATA.DIALOGUE_YESNO = {}
 
 local function speechState(sa)
   local s = { kind = "text" }
@@ -4399,8 +4454,8 @@ local function dialogueStep(game)
   local state = speechState(sa)
   local action, why = Dialogue.step(state, {
     seen = S.dialogueSeen,
-    keywords = DIALOGUE_KEYWORDS,
-    yesno = DIALOGUE_YESNO,
+    keywords = DATA.DIALOGUE_KEYWORDS,
+    yesno = DATA.DIALOGUE_YESNO,
     cap = 200,
     steps = steps,
   })
@@ -4477,7 +4532,7 @@ end
 
 -- P6 campaign observation (PLAN §4.2), behind ZZBOT_CAMPAIGN=1: the planner
 -- runs on every world change and logs the objective it would pick. The strict
--- TOWN_ORDER route keeps driving until headless runs verify the predicates
+-- DATA.TOWN_ORDER route keeps driving until headless runs verify the predicates
 -- (§8.4/§8.15); this only produces the objective events to compare against.
 local function campaignState(game)
   local state = {}
@@ -4693,11 +4748,11 @@ local function markDungeonComplete(game, dungeonName)
   ev("dungeon_done", {dungeon = dungeonName, entrance = tostring(entrance)})
   local idx = entrance and townIndex(entrance) or S.townIndex
   S.townIndex = math.max(S.townIndex or 1, (idx or 1) + 1)
-  if S.townIndex > #TOWN_ORDER then
+  if S.townIndex > #DATA.TOWN_ORDER then
     campaignComplete("every town visited")
   else
     tourPending(game)
-    S.nextTown = TOWN_ORDER[S.townIndex]
+    S.nextTown = DATA.TOWN_ORDER[S.townIndex]
     log("CAMPAIGN: next target %s", S.nextTown)
   end
 end
@@ -4813,7 +4868,7 @@ local function tickWorld(game, player)
   -- the Overworld exit trigger and continue on the next world.
   if data and data.isTown then
     local px, py = playerPos(player)
-    local routeTown = TOWN_ORDER[S.townIndex or 1]
+    local routeTown = DATA.TOWN_ORDER[S.townIndex or 1]
     tourPending(game)
     if S.nextTown == name then
       S.nextTown = nil
@@ -4997,11 +5052,11 @@ local function tickWorld(game, player)
     local idx = townIndex(name)
     if idx and (S.townIndex or 1) == idx then
       S.townIndex = idx + 1
-      if S.townIndex > #TOWN_ORDER then
+      if S.townIndex > #DATA.TOWN_ORDER then
         campaignComplete("visited every town")
         return
       end
-      S.nextTown = TOWN_ORDER[S.townIndex]
+      S.nextTown = DATA.TOWN_ORDER[S.townIndex]
       log("CAMPAIGN: leaving %s, next target %s", name, S.nextTown)
     end
     S.phase = "leave-town"
@@ -5037,7 +5092,7 @@ local function tickWorld(game, player)
   if data and data.isOverworld then
     if not S.nextTown then
       tourPending(game)
-      S.nextTown = TOWN_ORDER[S.townIndex or 1]
+      S.nextTown = DATA.TOWN_ORDER[S.townIndex or 1]
       log("CAMPAIGN: resuming route at %s", tostring(S.nextTown))
     end
     -- Overworld "enemies" are only markers: contact turns into a Zoom battle
@@ -5299,6 +5354,18 @@ local function ensureTextHook(game)
   game.addText = function(self, text, ...)
     recentTexts[#recentTexts + 1] = tostring(text)
     if #recentTexts > 12 then table.remove(recentTexts, 1) end
+    -- Learned ledger (P8): attribute hits to their attacker while we can
+    -- still act on it, and credit kills as survived encounters.
+    if S.Knowledge and CFG.learn then
+      local kind, name = S.Knowledge.noteText(text)
+      if kind == "hit" then
+        S.lastHitBy, S.lastHitT = name, now()
+      elseif kind == "kill" and name
+        and (name ~= S.lastKillName or now() - (S.lastKillT or 0) > 1) then
+        S.lastKillName, S.lastKillT = name, now()
+        S.Knowledge.recordKill(name, S.prof and S.prof.level)
+      end
+    end
     return original(self, text, ...)
   end
 end
@@ -5363,10 +5430,21 @@ local function checkGlobal()
       tostring(game.currentWorldName), player.position.x, player.position.y,
       tostring(gGameTurn), tostring(cellTypeName(dc)), tostring(player.isAflame))
     log("last messages: %s", table.concat(recentTexts, " | "))
-    ev("death", {
+    -- Learned ledger (P8): blame the last attacker we saw hit us, falling
+    -- back to a newest-first scan of the death scroll. Unattributed deaths
+    -- still count in the totals but sharpen no single enemy.
+    local killer = nil
+    if S.Knowledge and CFG.learn then
+      if now() - (S.lastHitT or -1e9) < 120 then killer = S.lastHitBy end
+      killer = killer or S.Knowledge.parseKiller(recentTexts)
+      S.Knowledge.recordDeath(killer, S.prof and S.prof.level)
+    end
+    local dfields = {
       world = game.currentWorldName, x = player.position.x, y = player.position.y,
       turn = gGameTurn, cell = cellTypeName(dc), last = table.concat(recentTexts, " | "),
-    })
+    }
+    if killer then dfields.by = killer end
+    ev("death", dfields)
     if CFG.quit then
       love.event.quit(1)
     else

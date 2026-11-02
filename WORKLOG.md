@@ -1211,6 +1211,50 @@ las preguntas del spike como datos:
   ending gate del watchdog/handleDialogs (Test49). Tres capas sobre el final
   malo.
 
+### Test56 — P8: aprender de las muertes (`zzbot.knowledge`, banda ZZBOT_LEARN)
+
+Nueva fase, fuera del PLAN original: el usuario pidió que el bot aprendiera de
+sus muertes y ajustara pesos por enemigo, sin sustituir la estrategia actual
+sino ofreciendo alternativas que se puedan probar. Se descartó RL profundo y
+redes (datos escasos, LÖVE sin autodiff, PC modesto) y se aterrizó en un
+**bandit de conteos Beta por (tipo de enemigo, banda de nivel)** que alimenta
+al modelo Monte Carlo que ya teníamos:
+
+- **`mod/zzbot/knowledge.lua`** (puro, sin LÖVE): ledger `enemigo@nivel →
+  {a=muertes, b=encuentros sobrevividos}`; `threatMult` devuelve `1.0` sin
+  opinión (menos de `MIN_AB=5` observaciones) y en caso contrario
+  `1 + K·(p − p0)` con `p0=0.05` y clamp `[0.5, 4.0]` — una mala racha nunca
+  puede lanzar al bot por un acantilado. Atribución del asesino por texto:
+  `noteText` reconoce "The X hits you for N" (con lista negra de verbos de
+  curación) y "You kill the X"/"The X dies"; `parseKiller` escanea lo más
+  nuevo primero. Persistencia como fuente Lua junto al log de métricas,
+  escritura atómica (tmp+rename), carga estricta: una entrada corrupta
+  rechaza el fichero entero en vez de envenenar a medias.
+- **Cableado en `init.lua`, todo tras `ZZBOT_LEARN=1`**: `enemyWeight`
+  multiplica SOLO el daño entrante del hostil (`hit/maxHit/modelHit/
+  modelMaxHit` y derivados `dps/cost`) por el multiplicador aprendido; el
+  daño nuestro no se toca. El hook de `addText` atribuye golpes en vivo
+  (`S.lastHitBy`, ventana de 120 s) y acredita kills como encuentros
+  sobrevividos; en la muerte se registra `by=` en el evento `death`.
+  Sin `ZZBOT_LEARN` el bot no lee ni escribe nada: multiplicador 1.0
+  garantizado.
+- **Corrección obligatoria descubierta en el camino**: el chunk principal de
+  `init.lua` llevaba **más de 200 locals desde P6/P7** — el fichero no
+  compilaba bajo los límites reales de Lua 5.1/LuaJIT (la sucesión de
+  verificaciones anteriores no lo detectó). Fix mecánico: 26 tablas de datos
+  estáticas (`DIRS`, `CC`, `TOWN_ORDER`, `WD`, `SELL_RESERVE`…) empaquetadas
+  en una única tabla `DATA`; compila en Lua 5.1 y 5.5, 12/12 archivos de
+  test en verde en ambos.
+- 18 tests en `tools/test_knowledge.lua`: normalización, buckets de nivel
+  (1-2/3-4/5-9/10-14/15+), parsing con lista negra de curación, guard de
+  `MIN_AB`, clamps, independencia de buckets, matching por subcadena entre
+  nombres de mensaje e ids de actor, round-trip de persistencia, fichero
+  corrupto, operación sin path.
+- Pendiente (siguiente lote): extracción de genome (alpha, horizonte, etc.)
+  y `tools/evolve.lua` — búsqueda evolutiva offline sobre los knobs de CFG,
+  con la muerte/éxito como recompensa verificable. Ese es el segundo nivel
+  del sistema de aprendizaje acordado.
+
 ### Estado de las fases tras la branch `glm`
 
 | Fase | Alcance | Estado |
@@ -1223,6 +1267,7 @@ las preguntas del spike como datos:
 | P5 | modelo v2 (ranged/AOE/power), readiness | módulo + tests; readiness en ferry |
 | P6 | planner de campaña + grafo | módulos + tests; observación tras flag |
 | P7 | patas de viaje, spike del mar | módulo + tests; spike documentado |
+| P8 | conocimiento aprendido de muertes (`zzbot.knowledge`) | módulo + tests; modulación tras `ZZBOT_LEARN` |
 
 Bloqueado por verificación headless (necesita el AppImage en `work/`):
 ejecución de `shoot`/`power` en el chooser, binding de skills (§8.9), nombres
