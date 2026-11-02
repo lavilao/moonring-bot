@@ -92,39 +92,56 @@ local S = {
   phase = "boot",
 }
 
-local logFile
-local function log(fmt, ...)
-  local msg = string.format(fmt, ...)
-  print("[zzbot] " .. msg)
-  if CFG.logpath then
-    logFile = logFile or io.open(CFG.logpath, "a")
-    if logFile then
-      logFile:write(string.format("%s %s\n", os.date("%H:%M:%S"), msg))
-      logFile:flush()
-    end
-  end
-end
+-- Human log + machine-parseable events (PLAN §0.3). P0 module split: the
+-- implementation lives in zzbot.metrics so tools/test_metrics.lua can verify
+-- the EV| format without the game. The inline fallbacks below are the
+-- pre-split behavior and must be kept in sync with mod/zzbot/metrics.lua.
+local Metrics = {}
+pcall(function() Metrics = require("zzbot.metrics") end)
 
--- Machine-parseable event line for tools/check_log.lua. Values are sanitized
--- so each line stays a flat key=value list that a shell tool can assert on.
-local function ev(kind, fields)
-  local parts = { string.format("EV|t=%.3f|kind=%s", love.timer.getTime() - S.t0, tostring(kind)) }
-  if fields then
-    local keys = {}
-    for k in pairs(fields) do keys[#keys + 1] = k end
-    table.sort(keys)
-    for _, k in ipairs(keys) do
-      local v = tostring(fields[k]):gsub("[^%w%._%-/:%+,]", "_")
-      parts[#parts + 1] = k .. "=" .. v
+local logFile
+local log, ev
+if Metrics.log and Metrics.ev then
+  Metrics.init({
+    logpath = CFG.logpath,
+    t0 = S.t0,
+    clock = function() return love.timer.getTime() end,
+  })
+  log, ev = Metrics.log, Metrics.ev
+else
+  log = function(fmt, ...)
+    local msg = string.format(fmt, ...)
+    print("[zzbot] " .. msg)
+    if CFG.logpath then
+      logFile = logFile or io.open(CFG.logpath, "a")
+      if logFile then
+        logFile:write(string.format("%s %s\n", os.date("%H:%M:%S"), msg))
+        logFile:flush()
+      end
     end
   end
-  local msg = table.concat(parts, "|")
-  print("[zzbot] " .. msg)
-  if CFG.logpath then
-    logFile = logFile or io.open(CFG.logpath, "a")
-    if logFile then
-      logFile:write(string.format("%s %s\n", os.date("%H:%M:%S"), msg))
-      logFile:flush()
+
+  -- Machine-parseable event line for tools/check_log.lua. Values are sanitized
+  -- so each line stays a flat key=value list that a shell tool can assert on.
+  ev = function(kind, fields)
+    local parts = { string.format("EV|t=%.3f|kind=%s", love.timer.getTime() - S.t0, tostring(kind)) }
+    if fields then
+      local keys = {}
+      for k in pairs(fields) do keys[#keys + 1] = k end
+      table.sort(keys)
+      for _, k in ipairs(keys) do
+        local v = tostring(fields[k]):gsub("[^%w%._%-/:%+,]", "_")
+        parts[#parts + 1] = k .. "=" .. v
+      end
+    end
+    local msg = table.concat(parts, "|")
+    print("[zzbot] " .. msg)
+    if CFG.logpath then
+      logFile = logFile or io.open(CFG.logpath, "a")
+      if logFile then
+        logFile:write(string.format("%s %s\n", os.date("%H:%M:%S"), msg))
+        logFile:flush()
+      end
     end
   end
 end
