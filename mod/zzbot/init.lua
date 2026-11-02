@@ -20,6 +20,17 @@ pcall(function() Gear = require("zzbot.gear") end)
 local Dialogue
 -- Speech driver (PLAN §3.3). Missing module degrades to press-Return.
 pcall(function() Dialogue = require("zzbot.dialogue") end)
+local Gods
+-- God expert profiles (PLAN §3.4). Missing module degrades to no taboos.
+pcall(function() Gods = require("zzbot.gods") end)
+local Taboo
+-- The sin guard called at every choke point. Missing module degrades to
+-- nothing forbidden.
+pcall(function() Taboo = require("zzbot.taboo") end)
+local Powers
+-- Power policy and targeting solvers (PLAN §3.4). Missing module degrades to
+-- no powers.
+pcall(function() Powers = require("zzbot.powers") end)
 
 -- True while pressing Return on the open speech box could trigger an ending.
 -- Every signal is best-effort: the game property is read through a pcall and
@@ -65,6 +76,7 @@ local CFG = {
   gear      = (os.getenv("ZZBOT_GEAR") == "1"),
   lamp      = (os.getenv("ZZBOT_LAMP") == "1"),
   dialogue  = (os.getenv("ZZBOT_DIALOGUE") == "1"),
+  powers    = (os.getenv("ZZBOT_POWERS") == "1"),
 }
 
 local S = {
@@ -1578,6 +1590,17 @@ end
 -- web is treated as a wall while retreating: stepping on it costs us ~46 ut,
 -- which hands the pack several free bites.
 local function doFlee(game, player, cell, why)
+  -- P4 observability: fleeing is sin for the Wolf. The doctrine that should
+  -- replace it (front-loaded buffs, earlier healing) is not implemented, so
+  -- this records the sin instead of bricking the bot's survival.
+  local profile = Gods and Gods.get and Gods.get(CFG.god)
+  local veto = profile and Taboo and Taboo.check
+    and Taboo.check(profile, "flee")
+  if veto and now() - (S.fleeSinT or 0) > 10 then
+    S.fleeSinT = now()
+    log("taboo: fleeing is %s for the %s", veto, tostring(CFG.god))
+    ev("sin", { kind = "flee", reason = veto, world = game.currentWorldName })
+  end
   cell = cell or findFleeCell(game, player)
   local steps = cell and travelSteps(game, player, cell.x, cell.y, true, true)
   if not (steps and steps[1]) then
@@ -3429,7 +3452,20 @@ local function equipStep(game, player)
       end
     end
   end
-  local plan = Gear.planEquip(records, { worn = worn })
+  local profile = Gods and Gods.get and Gods.get(CFG.god)
+  local plan = Gear.planEquip(records, {
+    worn = worn,
+    -- P4 taboo hook: a heavy weapon never reaches the Harlequin's hands.
+    allowed = profile and function(r)
+      local veto = Taboo and Taboo.check and Taboo.check(profile, "equip", r)
+      if veto then
+        ev("taboo_block", {
+          kind = "equip", item = r.objectType or "", reason = veto,
+        })
+      end
+      return veto
+    end or nil,
+  })
   local swap = plan[1]
   if not swap then return false end
   local target
@@ -4402,6 +4438,37 @@ local function typeStep()
   return true
 end
 
+-- P4 power catalog probe (PLAN §3.4), behind ZZBOT_POWERS=1: a research
+-- spike that logs what CActions.static.data actually exposes, so the
+-- descriptor tags and the model v2 get authored against real data (§8.7).
+-- It never binds a key or fires anything.
+local function powerCatalogProbe()
+  if S.catalogDone then return end
+  S.catalogDone = true
+  local data
+  pcall(function() data = CActions and CActions.static and CActions.static.data end)
+  if not data then
+    pcall(function() data = require("CActions").static.data end)
+  end
+  if not data then
+    log("powers: CActions unavailable, catalog probe skipped")
+    ev("power_catalog", { state = "unavailable" })
+    return
+  end
+  local count, violent = 0, 0
+  for id, entry in pairs(data) do
+    count = count + 1
+    local d = Powers and Powers.descriptor and Powers.descriptor(id, entry)
+    if d and d.isViolent then violent = violent + 1 end
+    if d and (d.energyCost or d.targeting) then
+      log("powers: %s energy=%s targeting=%s radius=%s violent=%s", tostring(id),
+        tostring(d.energyCost), tostring(d.targeting), tostring(d.radius),
+        tostring(d.isViolent))
+    end
+  end
+  ev("power_catalog", { state = "ok", count = count, violent = violent })
+end
+
 local function handleDialogs(game)
   if not (game.confirmBox and game.confirmBox.isOpen) then
     S.confirmSeen = nil
@@ -5146,6 +5213,7 @@ local function tick(game)
   end
 
   if watchdog(game, player) then return end
+  if CFG.powers then powerCatalogProbe() end
   if typeStep() then return end
   if handleDialogs(game) then return end
   if game.isGameOver then return end

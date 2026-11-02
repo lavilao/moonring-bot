@@ -1111,3 +1111,34 @@ pregunta abierta §8.5):
   vacío hasta verificar las claves de prompt.
 - El gate del Archonte (Test49) se evalúa ANTES del driver, así que la
   exhaustión de diálogo nunca alcanza al final malo.
+
+### Test52 — P4: perfiles de dioses, guardia de tabú y catálogo de poderes
+
+Sexta fase del plan (§3.4). Tres módulos puros (32 tests) + cableado mínimo:
+
+- **`mod/zzbot/gods.lua`**: un perfil por dios SOLO con lo que el plan afirma;
+  lo no verificado (celdas de skill, prioridades de stats, valores de pecado)
+  queda fuera (§8.7/§8.9). Tabúes: Harlequin `heavyWeapon` (armas fuera de
+  pin/dagger/rapier), Dust `healPotions` (solo `potion_water`), Angels
+  `injustice`, Wolf `flee`, Lady `nonBloodFood`. Dios desconocido = perfil
+  vacío = nada prohibido.
+- **`mod/zzbot/taboo.lua`**: `check(profile, kind, payload)` con cinco
+  chokepoints (equip/heal/attack/flee/food). La regla heal distingue pociones
+  de otras curaciones: el Lifestone y el descanso son lícitos para el Dust
+  (un test pescó la sobreprohibición). Arma de clase desconocida no se puede
+  juzgar y se permite — el pecado viene del USO, no del equipar; el veto de
+  equip es la mitad preventiva.
+- **`mod/zzbot/powers.lua`**: `shouldFire` con gates auditables por tag
+  (damage≥1 enemigo, aoe≥3, heal si missingHP≥100, buff una vez y con
+  combate, escape solo si el veredicto dice que huir falla) y tres solvers:
+  `bestTarget` (nearest/danger, nunca muta los registros), `bestDirection`
+  (8 direcciones, aliado = -100), `bestLocation` (radio/distancia, nunca
+  cubre al aliado). `descriptor()` traduce entradas de CActions.
+- **Cableado**: el gancho `allowed()` de `equipStep` ahora aplica el tabú del
+  dios activo (`EV|kind=taboo_block`); `doFlee` emite `EV|kind=sin` de
+  observabilidad para el Wolf (la doctrina que sustituye la huida no existe
+  aún, así que NO se bloquea — bloquear sin doctrina es una espiral de
+  muerte); y `ZZBOT_POWERS=1` lanza una sonda one-shot del catálogo
+  `CActions.static.data` que registra energía/targeting/radio de cada poder
+  para autorar los tags contra datos reales (§8.7). Nunca enlaza teclas ni
+  dispara nada.
