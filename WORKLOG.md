@@ -1086,3 +1086,28 @@ abiertos: columnas exactas de objectData y nombres de objetos de lámpara):
   objetos. Detrás de `ZZBOT_GEAR=1` / `ZZBOT_LAMP=1` (default off).
 - Los tests pescaron dos bugs de diseño antes del commit: el veto no excluía
   al candidato del plan y el épsilon float soltaba un drop extra.
+
+### Test51 — P3: driver de diálogo (`zzbot.dialogue`)
+
+Quinta fase del plan (§3.3). Módulo puro con 12 tests + cableado tras
+`ZZBOT_DIALOGUE=1` (default off; los nombres de campos de speechArea son la
+pregunta abierta §8.5):
+
+- **`mod/zzbot/dialogue.lua`**: máquina de estados sobre speechArea. Texto
+  plano avanza; las choices se agotan de una en una (la primera sin usar, en
+  el orden de la caja; "Close/Leave/Bye" nunca son keywords); los prompts de
+  texto teclean una lista ordenada de keywords y caen en "bye"; los yes/no
+  siguen una tabla de política cuyo default es DECLINAR. Cap de 200 pasos por
+  npc/visita y agotamiento → `dialogue_stuck` / `dialogue_exhausted` +
+  Escape. El driver es dueño del set de vistos: cada pick se marca dentro de
+  `step`, así un caller despistado no puede entrar en bucle (un test pescó
+  este contrato).
+- **Cableado**: `dialogueStep` sondea `choiceArray/choices/keywordArray` y
+  `inputMode/typedInput` con pcall — si la caja no encaja, cae al
+  press-Return de siempre. La cola de tecleo (`S.typingQueue`) inyecta un
+  carácter por tick por los mismos diccionarios que las flechas, y corre en
+  el tick antes de `handleDialogs`. Keywords de campaña precargadas:
+  `Death_Has_Dominion_Over_All` (frase del Jest, §4.1); `DIALOGUE_YESNO`
+  vacío hasta verificar las claves de prompt.
+- El gate del Archonte (Test49) se evalúa ANTES del driver, así que la
+  exhaustión de diálogo nunca alcanza al final malo.

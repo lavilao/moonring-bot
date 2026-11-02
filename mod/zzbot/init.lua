@@ -17,6 +17,9 @@ local Gear
 -- Gear scoring and burden policy (PLAN §3.2). Missing module degrades to the
 -- plain sell protection that already exists.
 pcall(function() Gear = require("zzbot.gear") end)
+local Dialogue
+-- Speech driver (PLAN §3.3). Missing module degrades to press-Return.
+pcall(function() Dialogue = require("zzbot.dialogue") end)
 
 -- True while pressing Return on the open speech box could trigger an ending.
 -- Every signal is best-effort: the game property is read through a pcall and
@@ -61,6 +64,7 @@ local CFG = {
   tradeDebug = (os.getenv("ZZBOT_TRADE_DEBUG") == "1"),
   gear      = (os.getenv("ZZBOT_GEAR") == "1"),
   lamp      = (os.getenv("ZZBOT_LAMP") == "1"),
+  dialogue  = (os.getenv("ZZBOT_DIALOGUE") == "1"),
 }
 
 local S = {
@@ -4311,6 +4315,93 @@ else
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- P3 dialogue wiring (PLAN §3.3), behind ZZBOT_DIALOGUE=1. The speechArea
+-- field names for keyword choices and typed input are unverified (§8.5), so
+-- every probe is a pcall and an unknown shape falls back to the old
+-- press-Return behavior.
+-- Typed-input keywords the campaign needs (PLAN §4.1). The DialogueData CSV
+-- parsing lands with the campaign work; this list is hand-authored for now.
+local DIALOGUE_KEYWORDS = { "Death_Has_Dominion_Over_All" }
+-- Nothing is accepted until the prompt keys are verified (§8.5): the safe
+-- default in zzbot.dialogue is decline.
+local DIALOGUE_YESNO = {}
+
+local function speechState(sa)
+  local s = { kind = "text" }
+  local choices
+  pcall(function()
+    choices = sa.choiceArray or sa.choices or sa.keywordArray
+  end)
+  if type(choices) == "table" and #choices > 0 then
+    s.kind = "choice"
+    s.choices = choices
+    return s
+  end
+  local typed = false
+  pcall(function() typed = sa.inputMode or sa.typedInput or sa.isTextInput end)
+  if typed then s.kind = "typed" end
+  return s
+end
+
+local function dialogueStep(game)
+  local sa = game.speechArea
+  local world = tostring(game.currentWorldName)
+  -- Caps are per visit: the counters reset when the world changes.
+  if S.dialogueWorld ~= world then
+    S.dialogueWorld = world
+    S.dialogueSteps = {}
+  end
+  S.dialogueSeen = S.dialogueSeen or {}
+  local steps = Dialogue.count(S.dialogueSteps, world)
+  local state = speechState(sa)
+  local action, why = Dialogue.step(state, {
+    seen = S.dialogueSeen,
+    keywords = DIALOGUE_KEYWORDS,
+    yesno = DIALOGUE_YESNO,
+    cap = 200,
+    steps = steps,
+  })
+  if not action then
+    log("dialogue: %s in %s after %d steps", why, world, steps)
+    ev(why == "cap" and "dialogue_stuck" or "dialogue_exhausted", {
+      world = world, steps = steps,
+    })
+    pressKey("escape")
+    return true
+  end
+  if action.markSeen then
+    ev("dialogue", {
+      kind = state.kind, choice = action.markSeen, world = world,
+    })
+  end
+  if action.key == "type" then
+    S.typingQueue = { text = action.text, i = 1 }
+    return true
+  end
+  pressKey("return")
+  return true
+end
+
+-- Typed input goes through the same dictionaries as the movement keys, one
+-- character per tick; the queue survives in S. LOVE key constants have no
+-- underscore, so the Jest phrase's separators press the literal "_" key and
+-- the step cap plus the watchdog catch a game that never accepts it.
+local function typeStep()
+  local q = S.typingQueue
+  if not q then return false end
+  if q.i > #q.text then
+    S.typingQueue = nil
+    pressKey("return")
+    return true
+  end
+  local ch = q.text:sub(q.i, q.i)
+  if ch == " " then ch = "space" end
+  pressKey(ch)
+  q.i = q.i + 1
+  return true
+end
+
 local function handleDialogs(game)
   if not (game.confirmBox and game.confirmBox.isOpen) then
     S.confirmSeen = nil
@@ -4383,6 +4474,12 @@ local function handleDialogs(game)
       end
       pressKey("escape")
       return true
+    end
+    -- P3 speech driver: exhaust keyword choices, type campaign keywords,
+    -- decline unknown yes/no prompts. Unknown box shapes fall through to the
+    -- plain Return press (ZZBOT_DIALOGUE=1).
+    if CFG.dialogue and Dialogue and Dialogue.step then
+      if dialogueStep(game) then return true end
     end
     pressKey("return")
     return true
@@ -5049,6 +5146,7 @@ local function tick(game)
   end
 
   if watchdog(game, player) then return end
+  if typeStep() then return end
   if handleDialogs(game) then return end
   if game.isGameOver then return end
 
