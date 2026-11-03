@@ -204,7 +204,7 @@ function M.report(logText, traceDir)
   return table.concat(b, "\n")
 end
 
-if arg and arg[0] and arg[0]:match("postmortem%.lua$") then
+if arg and arg[0] and arg[0]:match("[/\\]postmortem%.lua$") then
   local logpath, traceDir = arg[1], arg[2]
   if not logpath then
     print("usage: lua tools/postmortem.lua <zzbot.log> [traceDir]")
