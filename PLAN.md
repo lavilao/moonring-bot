@@ -11,6 +11,76 @@
 
 ---
 
+## 0.0 Estado verificado (2026-11-12, antes de leer el resto)
+
+Este documento se escribió **sin acceso al repositorio** y por eso quedó por
+detrás del código: describe como "a construir" cosas que ya existen, y no
+menciona la línea de trabajo P8/P8b/P9 (aprendizaje de muertes, GA offline,
+trazas y postmortem). La tabla siguiente es el estado real, comprobado con
+`tools/unit.sh`, `tools/regress.sh` y lectura de los módulos.
+
+| Fase | Qué hay en el repo | Estado real |
+|---|---|---|
+| P0 | métricas, watchdog, guardia de confirmaciones, arnés | **completo** (Test47/49) |
+| P1 | ledger, barrido completo, escaleras, descenso multinivel | **completo** en mazmorra normal; salir de una mazmorra de reliquia necesita `key_master` (eso es P6) |
+| P2 | `gear.lua` (scoring, `planEquip`, `dropLadder`, `protectedSet`, `curePlan`), adaptador, curas, burden medido | **completo** salvo consumir `protectedSet` en la venta |
+| P3 | `dialogue.lua` + tests | módulo listo, cableado tras `ZZBOT_DIALOGUE`; **nunca verificado en A/B de pueblo** |
+| P4 | `gods.lua`, `taboo.lua`, `powers.lua` | tabú aplicado en equipar y curar; **ningún poder se ha disparado en partida** |
+| P5 | `model.lua` (816 líneas, Monte Carlo del reloj de combate) | simulador maduro; `shoot` ya está cableado (opción en el chooser + disparo real por `rangedWeapon`) y con `ZZBOT_MODEL=1` **empata con la heurística** en `dungeon` tras ampliar la ventana de decisión (A/B abajo); `power` sigue sin ofrecerse |
+| P6 | `campaign.lua`, `campaign_data.lua` | planner + observación tras flag, sin ejecutar objetivos |
+| P7 | `travel.lua`, spike del mar documentado | patas de viaje listas; mar sin tocar |
+| P8 | `knowledge.lua` (ledger Beta por enemigo y banda) | módulo + tests, `ZZBOT_LEARN=0` por defecto y **ningún run ha producido ledger** |
+| P8b | `tools/evolve.lua` (GA sobre knobs) | CLI + tests, nunca evaluado con partidas reales |
+| P9 | `trace.lua`, `tools/postmortem.lua`, `ZZBOT_POLICY` | completo y siempre activo |
+
+**El cuello de botella ya no es construir módulos, es verificarlos.** Casi todo
+lo que este plan pedía existe; lo que falta es evidencia de que mejora al bot y
+el interruptor por defecto. Cinco flags (`ZZBOT_MODEL`, `ZZBOT_LEARN`,
+`ZZBOT_DIALOGUE`, `ZZBOT_POWERS`, `ZZBOT_CAMPAIGN`) siguen en 0, así que el bot
+que corre los escenarios es esencialmente el de P1/P2 y todo lo demás es código
+sin ejercitar.
+
+### A/B ejecutado: primera versión del modelo perdía, la de hoy empata
+
+Mismo guardado (`save-dungeon-start`, Yarrow Cave), mismo `TIMEOUT=300`,
+`GEAR=1` en ambos:
+
+| Run | Resultado | Evidencia |
+|---|---|---|
+| `tools/regress.sh dungeon` | **PASS** | `level_done` con 19/20 contenedores a t=276, sin muerte; sale por `dungeon_blocked reason=chest_key_missing` |
+| `MODEL=1 LEARN=1 tools/regress.sh dungeon` (antes de cablear `shoot`) | **FAIL** | muerte a t=178 en 41,22 (`bones`), sin `level_done`; 24 decisiones del modelo en el log |
+| `MODEL=1 tools/regress.sh dungeon` (con `shoot` y ventana a distancia) | **PASS** | `level_done` con 19/20 a t=274, sin muerte, mismo final `chest_key_missing`; **19 disparos reales** (`EV|kind=shoot`, dist 1–3, `dmg=8`) |
+| `MODEL=1 LEARN=1` (con `shoot`) | **FAIL** | muerte a t=186 con `large_beetle`: todas las opciones a `pDeath=98–100%` y elige `hit`; es la falta de válvula (V1a), no el disparo |
+
+Aviso sobre el margen: el baseline necesita ~276 s de los 300 del `TIMEOUT`,
+así que repeticiones del mismo comando fallan por tiempo (17–19/20
+contenedores, sin muerte) sin que haya regresión: el camino sin modelo no
+ejecuta nada del código de `shoot` (verificado por grep: `DATA.rangedInfo` y
+`DATA.rangedTargets` solo se llaman desde la rama del modelo).
+
+La traza (`logs/zzbot-trace-*.txt`) dice **por qué**, y no es que el modelo
+prediga mal: predijo bien. Con `hp=142/400`, poise 55 y un hornet adyacente,
+evaluó `hit` con `pDeath=0.98` y `flee` con `pDeath=1.00`, eligió `hit`
+("minimise risk"), y repitió hit/flee hasta morir. Tres defectos de integración,
+no del simulador:
+
+1. **No hay válvula de escape.** `chooseEval` siempre devuelve la mejor opción
+aunque su `pDeathUpper` esté muy por encima de `alpha`; nunca cede el turno a
+la rama `avoid`/kite que en el baseline es justo la que evita el combate.
+2. **Decide demasiado tarde.** El modelo solo corre con `#adj > 0` (ya en
+contacto), donde huir es matemáticamente peor que pelear. La conducta que gana
+—alejarse a 6 casillas antes del contacto— vive en la capa de movimiento, que
+el modelo no puede elegir.
+3. **Desempate agresivo.** A igualdad de riesgo gana `meanHP` y luego
+`resourceCost`; `hit` cuesta 0 y `retreat` 0.02, así que el empate resuelve a
+favor de pelear.
+
+Conclusión para el plan: **no se enciende `ZZBOT_MODEL` hasta arreglar esos
+tres puntos y volver a medir.** El simulador no es el problema; el punto de
+decisión y la política de repliegue sí.
+
+---
+
 ## 0. Architecture decisions that everything else depends on
 
 ### 0.1 Reflex, objective and maintenance layers
@@ -74,13 +144,49 @@ Keep the human log, and add machine-parseable lines `EV|t=<s>|kind=<k>|k=v…`. 
 | **P2** | Gear/inventory (6.2), burden policy, lamp/amberbane basics (6.12), healing policy | P1 (loot creates the gear problem) | Needed before experts or deeper dungeons |
 | **P3** | Dialogue driver (6.6) | P0 | Campaign needs it; independent of P1/P2, can run in parallel |
 | **P4** | Power catalog, god experts, bindings and power use (6.3), taboo guard | P2 | Experts need gear and healing rules |
-| **P5** | Combat model v2: ranged, AOE, powers (6.5); Zoom survival (6.4) | P4 | The model needs the power catalog |
-| **P6** | Campaign graph (6.7) with relics 2, 1, 3, 4 in that order; herbs (6.10); reputation/shops (6.8) | P1–P5 | First real end-to-end objectives |
+| **P5** | Combat model: fix the decision point and the retreat policy, then ranged/AOE/powers (6.5); Zoom survival (6.4) | P4 | The simulator already exists; the wiring is what loses fights |
+| **P5b** | Learning loop: make `knowledge` produce and use data, with a lethal-scenario library (P8/P8b/P9 already built) | P5 | A model that is wrong about a fight the same way twice is a data source; today it has no data |
+| **P6** | Campaign graph (6.7) with relics 2, 1, 3, 4 in that order; herbs (6.10); reputation/shops (6.8) | P1–P5b | First real end-to-end objectives |
 | **P7** | Ships/sea (6.9), Tower of Veils chain, Lament, Archon, ending | P6 | Longest dependency chain, highest risk |
+
+**Re-sequenced work, in the order the evidence supports:**
+
+- **V0 — make the flags measurable (done 2026-11-12).** `tools/regress.sh`
+  accepts `MODEL=1`, `LEARN=1`, `GEAR=0` from the environment and keeps the
+  learned ledger inside the scenario's own XDG dir, so the same save can be run
+  twice without one run teaching the next. Every acceptance test below is an
+  A/B against the current default.
+- **V1 — fix the model before switching it on.** (a) When every contact option
+  exceeds `alpha`, hand the tick to the `avoid`/kite layer instead of executing
+  a 98%-death hit; (b) allow the model to be consulted in the approach window
+  (`dist <= 6`) so retreat is priced while it still works; (c) tie-break that
+  does not prefer the free action when the pack is unaffordable. Gate: `dungeon`
+  and `newgame` with `MODEL=1` must be no worse than baseline on `!death` and
+  `level_done`, N≥3.
+- **V2 — the actual P5 v2: ranged and powers in the action set.** `shoot` is
+  **done (2026-11-13)**: `buildCombatOptions` offers it from `getFinalPlayerRange()`
+  and ammo, `executeChoice` fires `rangedWeapon` via `targetedOffset` +
+  `performPendingActionAtTargetLocation`, and `tools/test_model.lua` has the
+  ranged case. Remaining: `power` from `powers.lua` descriptors (single-target,
+  AOE, self-heal, energy/cooldown gated by the caller) and its tests (AOE beats
+  single target on a pack, a power on cooldown is not chosen).
+- **V3 — learning with data.** Turn `ZZBOT_LEARN=1` on for a batch of runs so
+  the Beta ledger gets observations (it stays at 1.0 until 5 per enemy band),
+  add the "lethal scenario" library (`save-on-death` + `regress.sh`), and score
+  genomas with it instead of 15-minute full runs. Only then judge `evolve.lua`.
+- **V4 — flip the defaults.** `ZZBOT_MODEL`, `ZZBOT_LEARN`, `ZZBOT_GEAR`,
+  `ZZBOT_DIALOGUE`, `ZZBOT_POWERS` move to 1 one at a time, each with the whole
+  scenario suite green before and after.
 
 **Why Zoom comes late:** the deaths are a combat-capability problem (no pre-buff, powers, ranged), so diagnosing and fixing them needs P4/P5. In P0, add only the death-diagnosis instrumentation and a conservative "flee at first sight of a losing verdict" tweak.
 
 **Why campaign is late:** each relic dungeon is only as good as the loot sweep, combat and gear underneath it. Starting with the campaign would produce deaths with no way to diagnose them.
+
+**Why the learning phase is new and sits before the campaign:** `knowledge.lua`,
+`evolve.lua`, `trace.lua` and `postmortem.lua` are already written and tested,
+but no run has ever written a ledger entry (`knowledge fresh: 0 deaths, 0
+kills, 0 enemy kinds` is the only line any log contains), so the feature cannot
+be judged, and the campaign would consume deaths without learning from them.
 
 ---
 
@@ -159,8 +265,12 @@ The bot picks the minimum of `pathCost − classBonus`, where `classBonus` is sm
 - **Score** per slot from ObjectData columns. Melee is expected damage per time unit (damage over `weaponTimeCost`, adjusted for cooldown and the stat bonuses the build uses). Armor is defense per burden, weighted by the build's mobility need. Shield is `shieldBlockFraction` and the hands cost. Ranged weapons need ammo availability.
 - **Verification by the game's own numbers.** After equipping in a safe context (town, or a cleared dungeon level), read `getTotalPlayerMeleeAttackStatsAfterEquipmentDegradation` and defense totals, and revert if the build score dropped. Whether equipping is free and instant is an open question.
 - **Unidentified items.** `isObjectDataIdentified` and `isItemInert` suggest identification and curse mechanics. Until verified, treat unidentified gear conservatively: equip only if the score gain is large, and log it.
+  - **Done (2026-11-12).** `Gear.planEquip` requires a 2.0x score gain (vs 1.15x for known gear) when `identified == false`, and the plan entry carries `unidentified`; `equipStep` logs it and emits `equip` with `unidentified=true`. Pinned by two tests in `tools/test_gear.lua`. Still open: what `isItemInert` means for a cursed item once worn — no in-game example seen yet.
 - **Healing selection.** Extend `findHealPotion/useHealItem`: bandages, ointments, blood phials and lifestones as taboo-allowed. Dust must not use potions or ointments (except `potion_water`); Lady must not use non-blood food. Add a "don't waste" rule: heal only when predicted incoming burst, or HP, passes a threshold, rather than at a flat percentage.
+  - **Done (2026-11-12).** Cures are data-driven from `useFX1` (`G_Globals.cureStates`): bleed=Bandage, flame=Water, poison=Antidote, rot=Sera-leaf Oil, stun=Acitra Nectar, torpor=Blackwater Draft, blind=Sightsalve, mad=Bitterleaf Brew, deafness=Silentsalve, all=Arnaut's Panacea. `Gear.curePlan` picks the specific cure first and only spends the panacea on 2+ ailments (or a single health-draining one). `DATA.cureStep` runs at the top of `tryHeal`, never uses a cure whose status is not active, emits `cure`/`nocure` events and calls the P4 `Taboo.check(profile, "heal", …)` hook.
 - **Burden.** Keep burden under the multiplier threshold. When above, the drop ladder is: (1) equip upgrades, (2) drop the lowest value-per-weight item that isn't protected, in dungeons, (3) a sell trip only if the campaign allows. Inventory-full is not slot-based unless the source says otherwise (§8).
+  - **Open question answered (2026-11-12): the game has no player-facing drop.** Items leave the inventory only through use (`destroyOnUse`), sale (`sell_panel.lua`), or crafting/repair consumption (`actions.lua`); the only `drop` is the console command `console_drop`, which spawns a *new* object on the floor and does not remove the original. So step (2) of the ladder cannot be executed and `Gear.dropLadder` has no consumer by design: burden is managed by *not buying* and by selling. Keep the ladder as pure policy, do not wire it to a fake drop.
+  - Burden is now logged from the game's own numbers every beat (`burden weight=W/MAX mult=X`, `getRawPlayerBurdenAndMaxBurden` + `getPlayerTickCostMultiplier`). Multiplier is 0.8 empty, 1.0 at max burden, and grows past 1.0 above it; observed 0.87 at 14/40 in the smoke start.
 - **Sell protection.** `bestGearIDs` becomes "protected set" = equipped + best-per-slot for the active build + quest categories + all relic and key items.
 
 ### 3.3 Dialogue driver (6.6) — P3
@@ -206,14 +316,62 @@ talkNPC(npc):
 - **Skill purchases.** Follow `skillOrder`, using `activateCellForGridFactionAtXY` and the existing `skillCostMap`. The existing gift flow already supplies devotion, so the expert only decides which cells to buy.
 - **Friendly fire.** Angels' injustice taboo needs an ally/neutral flag on actors. Use the existing `isHostile`, and never target anything not hostile.
 
-### 3.5 Combat model v2 (6.5) — P5
+### 3.5 Combat model (6.5) — P5
 
-- **New actions in `model.lua`:** `shoot(target)`, `power(name, target|dir|loc)`, with energy and cooldown state in the sim.
-- **Inputs:** range and line of sight from ObjectData `range` and the map, ammo counts, projectile hit chance, AOE shape from `radius`, and status effects on both sides.
-- **Effects table.** Damage and status per power come from a hand-authored descriptor table, verified against the handler code. Add self-calibration: log `power_result` (predicted vs observed damage) and a script to compare across runs, so descriptor errors surface quickly.
-- **Ranged kiting.** Extend the `kite` action to use `canOutrun` and the enemy `enemyStep` speed model, with ranged enemies treated as a different threat class (cannot be kited without cover).
-- **Switching it on.** Keep `CFG.model` default off until the unit tests and the matrix (§5) show it beats the heuristic chooser, then flip the default. `S.modelErrors < 5` fallback stays.
-- **Tests.** Deterministic seeds in `tools/test_model.lua`, with cases for each new action: ranged beats melee at range, AOE beats single target against packs, a power on cooldown is not chosen.
+**Ya existe (`mod/zzbot/model.lua`, 816 líneas).** Simula el reloj de combate de
+Moonring: poise que absorbe sin desbordar, mordiscos con distribución Bates(3)
+por el CV real, veneno que resta la mitad de la vida actual y no mata, aguijones
+que invocan 2-4 avispas con su propio `attackTime`, huida con `allOutrun`, y
+rollouts de referencia de N=64 semillas. `M.evaluate` devuelve `pDeath`,
+`pDeathUpper` (Wilson 95%), `meanHP`, `p10HP`, daño medio, duración y kills.
+Soporta las acciones `attack`, `shoot`, `power` (single/AOE/self-heal), `heal`
+(con `enemyHeals` del Lifestone), `choke`, `flee`, `move` y `wait`. También
+tiene `readiness` (usada al cruzar el ferry) y `rank`.
+
+**Lo que no está cableado, y por eso pierde** (ver §0.0 para el A/B completo):
+
+- ~~`buildCombatOptions` nunca ofrece `shoot`~~: **hecho (2026-11-13)**. Se
+  ofrece `shoot` contra todo enemigo de `near` dentro de `getFinalPlayerRange()`
+  (3 con las piedras iniciales, 4 en `CActions.static.data`, manda el arma) y
+  con línea de fuego (`getLOMToWorldXY`), con `damage` de
+  `CActions.getRangedAverageDamage` (8 con `throwing_stones`) y `time` de
+  `weaponTimeCost`. `executeChoice` fija `targetedOffset` y llama a
+  `performPendingActionAtTargetLocation`; la munición se cuenta desde la pila
+  equipada, así que un arma sin piedras no genera la opción.
+- El modelo solo se consulta con `#adj > 0`, es decir, cuando el enemigo ya
+  pega. **Parcialmente corregido**: sin adyacentes la rama se abre solo si hay
+  un `shoot` posible, que es cuando el modelo aporta algo (disparar vs esperar
+  vs replegarse); la aproximación a más de `range` sigue en la capa de
+  movimiento. `power` sigue sin proponerse.
+- `chooseEval` no tiene repliegue: si la mejor opción está al 98% de muerte,
+  la ejecuta igual ("minimise risk" es solo una etiqueta en el log).
+- Empate a riesgo → `meanHP` → `resourceCost`, y el ataque cuesta 0.
+
+**Trabajo, en este orden:**
+
+1. **Repliegue.** Si `pDeathUpper` de todas las opciones de contacto supera
+   `alpha`, devolver `false` desde la rama del modelo para que manden las capas
+   de kite/`avoid` (que en el baseline sobreviven), y loguear
+   `model: all contact options > alpha (best=... )` una vez por ventana. Con
+   `shoot` vivo el modelo ya no muere en `dungeon`, pero sigue sin válvula para
+   el caso de que todas las opciones sean malas.
+2. **Ventana de aproximación.** Llevar la ventana más allá de `range`
+   (acción `move`/`retreat` ya modeladas) para que "alejarse y disparar"
+   compita contra "esperar a que llegue". Mantener el veto de curar sin daño
+   cercano que ya existe.
+3. **Poderes.** `power` desde `powers.lua` con
+   `energyCost`/`cooldown`/`targetingType` leídos de `CActions.static.data`.
+   `shoot` ya está (ver arriba); falta medir consumo de munición y acierto.
+4. **Auto-calibración.** `power_result` con daño predicho vs observado y
+   `shoot` con acierto/fallo, comparados en `tools/postmortem.lua`.
+5. **Encender.** `ZZBOT_MODEL=1` por defecto solo cuando el A/B (§5) empate o
+   gane en `dungeon` y `newgame`, N≥3. `S.modelErrors < 5` sigue como fallback.
+
+**Tests:** `shoot` ya tiene dos casos en `tools/test_model.lua` (a tres
+casillas mata y `attack` no; fuera de su `range` no mata). Faltan: `power`
+(AOE con `radius>1` mata más que un golpe simple contra un pack), una acción con
+`time` absurdo que no domine, y `rank` prefiriendo `pDeathUpper` menor antes que
+`meanHP` mayor.
 
 ### 3.6 Zoom survival (6.4) — P0 diagnostics, P5 fix
 
@@ -239,6 +397,39 @@ Maintain fuel when the world flag `allowAmber` is true. Keep a fuel-count thresh
 Objectives: obtain the deed (forged deed container at `clickclack-01Triggers.csv` 45,51, or buy it if the dialogue data allows), claim a ship by walking over it on the overworld, sail to the Kenner island for the `key_clue_final` step, and handle Yeleba only if the campaign needs the Great Key. Sailing needs its own `travel.lua` mode (`isSailing`, jetties, `callShipToXY`, cannon/telescope) and a sea-combat reflex. This is the least understood subsystem, so P7 starts with a research spike, not code. Whether the Tower chain needs Yeleba at all is unclear from the brief.
 
 ---
+
+### 3.11 Learning from deaths (P8, P8b, P9) — P5b
+
+**Ya existe:**
+
+- `knowledge.lua`: ledger Beta por (`actorType`, banda de nivel). Cada muerte
+  sube la peligrosidad, cada kill la baja; el multiplicador está limitado a
+  `[0.5, 4.0]` y **no se aplica hasta tener 5 observaciones**. Escala solo el
+  daño entrante (`hit`, `maxHit`, `dps`, `cost`) en `threatList`, es decir, lo
+  ven el modelo **y** la heurística, no el daño que hacemos.
+- `trace.lua` + `tools/postmortem.lua`: anillo de 60 ticks, clasificación
+  `SURPRISE`/`WARNED` de cada muerte, agregados de calibración.
+- `tools/evolve.lua`: GA offline sobre `alpha`, `horizon`, reservas y márgenes,
+  con élite y genoma #1 = default.
+- `ZZBOT_POLICY=cautious|aggressive|bandit` ya etiqueta cada `EV` de muerte.
+
+**Lo que falta para que signifique algo:**
+
+1. **Datos.** Ningún run ha escrito ledger (`knowledge fresh: 0 deaths, 0
+   kills, 0 enemy kinds`). Encender `ZZBOT_LEARN=1` en una tanda de runs, y
+   mantener el fichero por escenario para no mezclar bandas.
+2. **Evaluación barata.** La Capa 2 del plan-Claude ("biblioteca de escenarios
+   letales") sigue sin hacer: guardar el save unos segundos antes de cada
+   muerte (`save-on-death` en `tools/regress.sh`) y puntuar genomas por
+   supervivencia en esos escenarios. Sin eso, cada evaluación son 15 minutos y
+   el GA no converge.
+3. **Atribución.** `death by=nil` en el evento: `parseKiller` no encontró el
+   nombre en los últimos textos. Sin `by=`, el ledger aprende de la banda pero
+   no del enemigo, que es justo la señal que se quiere. Arreglar la atribución
+   antes de sacar conclusiones del aprendizaje.
+4. **Un solo camino.** El ledger llega al modelo a través de `threatList`, así
+   que funciona con `ZZBOT_MODEL=0`; conviene fijarlo con un test de integración
+   (dos enemigos, una muerte, `threatMult > 1` en el log).
 
 ## 4. Campaign and objective architecture (P6–P7)
 
@@ -290,6 +481,11 @@ Resume is "start, evaluate all `done()`, continue". The bot file (§0.4) holds o
 | P3 | each town save | town-only run | `dialogue` per NPC; flags set | All NPCs exhausted per town; tear obtained at MUT; no `dialogue_stuck` |
 | P4 | per-god saves (one each) | `ZZBOT_BUILD=pure:<god>` | `power_use`, `sin` | Kit built, keys bound, powers fired with right targeting, no sin events, per god |
 | P5 | Zoom-heavy save | repeat N=10 | `death` count, `power_result` calibration | 0 Zoom deaths in N runs; model beats heuristic on a fixed matrix |
+| **V0** | `save-dungeon-start`, `save-empty` | `MODEL=0/1`, `LEARN=0/1`, N≥3 | `death`, `level_done`, `choice`, `knowledge` | Hecho: baseline PASS (19/20 a t=276) vs modelo **FAIL** (muerte t=178). El arnés ya acepta `MODEL=`/`LEARN=` |
+| **V1** | same | `MODEL=1` tras el repliegue | `!death`, `level_done`, `model: all contact options` | Modelo ≥ baseline en ambos escenarios, N≥3 |
+| **V2** | pack fights, `thunder`/`power` fixtures | `MODEL=1` + munición | `shoot`/`power_result` | `shoot` ya dispara y empata en `dungeon` (19 tiros en el A/B); falta AOE > golpe simple en packs |
+| **V3** | lethal-scenario library | `LEARN=1` | `knowledge` loaded/saved, `death by=` no nulo | Ledger con ≥5 observaciones por enemigo y atribución correcta |
+| **V4** | full suite | defaults a 1 | all previous assertions | Suite completa verde con los flags encendidos |
 | P6 | after Jest etc. | campaign mode | `objective_done` | Each relic dungeon milestone reached; economy and dialogue regressions green |
 | P7 | all-relics save | full | `objective_done` through `archon`, ending flag | Good ending reached headless |
 
@@ -343,17 +539,20 @@ Resume is "start, evaluate all `done()`, continue". The bot file (§0.4) holds o
 3. **Harrowdus `leadsTo`:** how the town tick currently treats `dungeon2-01` and the `jest_key` lock (the §5 vs §7 conflict).
 4. **Reading world properties/flags** from the mod (`getProperty`-style APIs), for `done()` predicates.
 5. **Dialogue `conditions` syntax** and the game's evaluator function, for exhaust-all selection.
-6. **Equip timing:** whether equipping costs game time, whether it is allowed in combat, and what `isItemInert` / unidentified items imply (`inventory_panel.lua:398–455`, `state_game.lua:17728, 17792`).
+6. **Equip timing:** whether equipping costs game time, whether it is allowed in combat, and what `isItemInert` / unidentified items imply (`inventory_panel.lua:398–455`, `state_game.lua:17728, 17792`). **Parcial (2026-11-12):** unidentified gear now needs a 2.0x gain; `isItemInert` still unobserved.
 7. **Power effect handlers** in `actorManager:performActionWithActor`, to author model descriptors. Also the exact meaning of "technology" for Lady's taboo and the Harlequin weapon predicate (`state_game.lua:20354–20432`).
 8. **Sin decay and curse recovery:** `alterSin`, `removeCurse` (`state_game.lua:20491`) and where the game invokes it.
 9. **Binding powers:** whether writing `skillBindings` (`skill_tree.lua:429`) directly is safe or the UI path has side effects; whether any skill cells require NPC trainers.
-10. **Inventory limits:** slot cap vs burden only; the burden value where `getPlayerTickCostMultiplier` starts penalizing; whether dropping items is possible and how.
+10. **Inventory limits:** slot cap vs burden only; the burden value where `getPlayerTickCostMultiplier` starts penalizing; whether dropping items is possible and how. **Respondido (2026-11-12):** there is no player-facing drop. Items leave the inventory only by use (`destroyOnUse`), sale, or crafting; `console_drop` spawns a new floor object and does not remove the original. The multiplier is `lerp(0.8, 1, weight/max)` below max burden and `weight/max` above it, and is now logged every beat (`burden weight=14/40 mult=0.87` in the smoke start).
 11. **How Zoom is entered** from the overworld or towns, and whether it can be avoided on a route.
 12. **Lockpick consumption and the chest-key flow** (`attemptToUnlockChestAtMapXY`, `actor.lua:5337`).
 13. **RNG seeding** from the mod, for reproducible runs.
 14. **When the game autosaves**, and what happens to unsaved progress on death or quit (impacts resume).
 15. **Role of `archonDungeon-01` and the `magick` flag** (MUT triggers CSV), and the exact `archon1` branch conditions for good vs bad ending.
 16. **Sea:** `isSailing`, `callShipToXY`, the Yeleba/Cannon2 requirement, and whether the Tower chain needs a ship at all.
+17. **Why does the model call adjacent flight fatal?** In the A/B it priced `flee` at `pDeath=100%` with one hornet adjacent and kept choosing `hit` instead. Verify with a fixture whether that is the model being right (a parting bite chain) or the flee rollout being short (`moveSteps` 1-8 over a `horizon` that outlasts it).
+18. **Ranged aiming flow:** *respondida (2026-11-13).* No hace falta abrir el overlay de apuntado. `G_Globals.keyRanged = "r"` solo cambia `IM_INPUT.ranged`, que en `state_game.lua:4033` llama a `getFiringErrors()` y a `playerInitiatingAction("rangedWeapon", player:getFinalPlayerRange())`; la acción es `targetingType="location"`, `distance=4`, `radius=1`, `timeCost=12`, `isBlockedByWalls=true`. `getFiringErrors` exige `isSkillUsableByPlayer("rangedWeapon")`, `player.rangedInventoryID ~= 0` y `player:getAmmoForCurrentRangedWeapon() > 0`. El bot reproduce el disparo con `player.targetedOffset:set(dx,dy)` + `player:performPendingActionAtTargetLocation({id="rangedWeapon", distance=…, radius=1, noPrediction=true, playerDoesNotBlockTarget=false, isBlockedByWalls=true})`; queda por verificar en partida que consume una piedra y que la `rangedAngleVariance` (escalada por percepción) explica los fallos que registre el log.
+19. **Kill/death attribution:** why `parseKiller` returns nil on real deaths (`EV|kind=death ... by=nil`). The learning ledger needs `by=` to move the right multiplier.
 
 ---
 

@@ -162,6 +162,23 @@ run("lethal rolls give nonzero death probability", function()
     ("upper %s <= p %s"):format(tostring(ev.pDeathUpper), tostring(ev.pDeath)))
 end)
 
+run("ranged shot reaches what a swing cannot", function()
+  local state = { hp = 100, maxHP = 100, poise = 0, maxPoise = 200, injuryAge = 0 }
+  local pack = { enemy({ hp = 10, maxHP = 10, hit = 0, maxHit = 1, dist = 3, speed = 0.01, attackTime = 10000 }) }
+  local opts = { N = 1, seed = 31, horizon = 1 }
+  local shot = M.evaluate({ kind = "shoot", range = 4, damage = 100 }, state, pack, prof({ hit = 100 }), opts)
+  local swing = M.evaluate({ kind = "attack", target = 1 }, state, pack, prof({ hit = 100 }), opts)
+  check(shot.meanKills > 0, "shot at three tiles killed nothing")
+  check(swing.meanKills == 0, "swung at a target three tiles away")
+end)
+
+run("ranged shot outside its range kills nothing", function()
+  local state = { hp = 100, maxHP = 100, poise = 0, maxPoise = 200, injuryAge = 0 }
+  local pack = { enemy({ hp = 10, maxHP = 10, hit = 0, maxHit = 1, dist = 4, speed = 0.01, attackTime = 10000 }) }
+  local ev = M.evaluate({ kind = "shoot", range = 2, damage = 100 }, state, pack, prof({ hit = 100 }), { N = 1, seed = 37, horizon = 1 })
+  check(ev.meanKills == 0, "shot reached past its range")
+end)
+
 if failures > 0 then
   print(("%d test(s) failed"):format(failures))
   os.exit(1)

@@ -35,10 +35,22 @@ run("melee value is damage per time with the might curve", function()
     "might bonus must cap at 100%")
 end)
 
+run("the game's own DPS wins over damage/timeCost", function()
+  -- ObjectData has no `damage` column for scoring purposes: DPS_Calculation is
+  -- the number the game itself uses, and the adapter now reads it.
+  check(G.meleeScore({ dps = 45.6, damage = 30, timeCost = 15 }) == 45.6,
+    "dps not preferred")
+  check(G.meleeScore({ dps = 0, damage = 30, timeCost = 15 }) == 2,
+    "zero dps must fall back to damage/time")
+  check(G.score({ category = "melee", dps = 68.25 }) == 68.25, "dispatch")
+end)
+
 run("ranged without ammo scores zero", function()
   check(G.rangedScore({ damage = 40, timeCost = 20 }) == 0, "no ammo field")
   check(G.rangedScore({ damage = 40, timeCost = 20, ammo = 0 }) == 0, "zero ammo")
   check(G.rangedScore({ damage = 40, timeCost = 20, ammo = 5 }) == 2, "with ammo")
+  check(G.rangedScore({ dps = 52.5, ammo = 5 }) == 52.5, "dps with ammo")
+  check(G.rangedScore({ dps = 52.5, ammo = 0 }) == 0, "dps but no ammo")
 end)
 
 run("armour is defense per burden", function()
@@ -51,6 +63,42 @@ run("shield divides block by hands", function()
   check(G.shieldScore({ block = 30, hands = 1 }) == 30, "one hand")
   check(G.shieldScore({ block = 30, hands = 2 }) == 15, "two hands")
   check(G.shieldScore({ block = 30 }) == 30, "default hands")
+end)
+
+-- Adapter against real ObjectData rows (data/ObjectData - Sheet1.csv).
+
+run("objectData rows map to records without damage/defense columns", function()
+  local dagger = G.fromObjectData({ ID = 1, category = "melee", objectType = "dagger" }, {
+    physicalMeleeDam = "30", magicalMeleeDam = "0", DPS_Calculation = "45.60",
+    weaponTimeCost = "15", weight = "4", price = "200",
+    shieldBlockFraction = "0", hands = "1", range = "1",
+  })
+  check(dagger.damage == 30, "physicalMeleeDam must become damage")
+  check(dagger.dps == 45.6, "DPS_Calculation must become dps")
+  check(dagger.weight == 4 and dagger.burden == 4, "weight is the burden")
+  check(G.score(dagger) == 45.6, "dagger scores its game dps")
+
+  local tunic = G.fromObjectData({ ID = 2, category = "body", objectType = "tunic" }, {
+    physicalMeleeDam = "0", magicalMeleeDam = "0", DPS_Calculation = "NA",
+    physicalDef = "2", magicalDef = "0", weight = "8", price = "200",
+  })
+  check(tunic.dps == nil, "NA dps must not parse")
+  check(tunic.defense == 2, "physicalDef must become defense")
+  check(G.score(tunic) == 0.25, "armour score is defence per weight")
+end)
+
+run("a better weapon outranks the worn dagger", function()
+  local num = function(v) return tonumber(v) end
+  local dagger = G.fromObjectData({ ID = 1, category = "melee" }, {
+    physicalMeleeDam = "30", weaponTimeCost = "15", weight = "4",
+  }, num)
+  local axe = G.fromObjectData({ ID = 2, category = "melee" }, {
+    physicalMeleeDam = "130", weaponTimeCost = "30", weight = "12",
+  }, num)
+  local plan = G.planEquip({ dagger }, { worn = { melee = dagger } })
+  check(#plan == 0, "worn dagger must not be re-equipped")
+  plan = G.planEquip({ dagger, axe }, { worn = { melee = dagger } })
+  check(#plan == 1 and plan[1].to == 2, "axe should replace the dagger")
 end)
 
 run("score dispatches by category", function()
@@ -194,6 +242,65 @@ run("lamp policy keeps a reserve and begs for supply", function()
     inDark = true, lampOn = false }).supply == true, "reserve breached")
   check(G.lampPlan({ allowAmber = true, hasLamp = true, fuel = 0, lampOn = true })
     .toggle == true, "empty lamp must be snuffed")
+end)
+
+run("unidentified gear needs a much larger gain to be worth the risk",
+  function()
+    local worn = melee(20)
+    worn.ID = 1
+    -- 1.3x the current score: enough for a known weapon, not for a gamble.
+    local gamble = melee(26)
+    gamble.ID = 2
+    gamble.identified = false
+    local plan = G.planEquip({ gamble }, { worn = { melee = worn },
+      minGain = 1.15 })
+    check(#plan == 0, "an unidentified 1.3x upgrade must be refused")
+    gamble.damage = 60
+    local plan2 = G.planEquip({ gamble }, { worn = { melee = worn },
+      minGain = 1.15 })
+    check(#plan2 == 1 and plan2[1].unidentified == true,
+      "a large unidentified gain is taken and flagged")
+  end)
+
+-- Ailment cures -----------------------------------------------------------
+
+run("a cure is only spent on an ailment the player actually has", function()
+  check(G.curePlan({}, { cure_bleed = true }) == nil, "nothing to cure")
+  check(G.curePlan({ isBleeding = true }, {}) == nil, "no stock")
+end)
+
+run("the specific cure wins over the panacea", function()
+  local fx = G.curePlan({ isBleeding = true, isBlind = true },
+    { cure_bleed = true, cure_all = true })
+  check(fx == "cure_bleed", "expected the bandage, got " .. tostring(fx))
+end)
+
+run("the panacea clears two ailments when no specific cure is carried", function()
+  local fx = G.curePlan({ isBleeding = true, isMad = true },
+    { cure_all = true })
+  check(fx == "cure_all", "expected the panacea, got " .. tostring(fx))
+end)
+
+run("the panacea is not wasted on a single harmless ailment", function()
+  check(G.curePlan({ isDeaf = true }, { cure_all = true }) == nil,
+    "deafness does not earn a panacea")
+  check(G.curePlan({ isMad = true }, { cure_all = true }) == nil,
+    "madness alone does not earn a panacea")
+end)
+
+run("a health-draining ailment does earn the panacea when it is all we have",
+  function()
+    for _, flag in ipairs({ "isBleeding", "isAflame", "isPoisoned",
+        "isRotting" }) do
+      local fx = G.curePlan({ [flag] = true }, { cure_all = true })
+      check(fx == "cure_all", flag .. " should be cured with the panacea")
+    end
+  end)
+
+run("draining ailments are cured before cosmetic ones", function()
+  local fx = G.curePlan({ isDeaf = true, isBleeding = true },
+    { cure_bleed = true, cure_deafness = true })
+  check(fx == "cure_bleed", "expected the bandage first, got " .. tostring(fx))
 end)
 
 if failures > 0 then

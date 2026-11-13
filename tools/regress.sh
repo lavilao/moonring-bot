@@ -10,12 +10,26 @@
 #   SAVE     path to a save backup (copied to a throwaway XDG dir)
 #   TIMEOUT  in-game seconds before the bot gives up (default 180)
 #   SPEED    simulation multiplier (default 8)
+#   START_TOWN  index in TOWN_ORDER the campaign starts at (default 1)
+#   MAPDUMP  optional path for a map dump written on every level entry
+#   PEACEFUL 1 = send hostiles away on entry (test-only; loot/descent tests)
 #   WALL     wall-clock seconds before the process is killed (default
-#            TIMEOUT + 90)
+#            TIMEOUT + 90); passed to the bot as its own hard deadline
 #   ASSERT   bash array of check_log.lua specs
+#
+# A/B knobs also come from the environment, so the same save can be run twice:
+#   MODEL=1   tools/regress.sh dungeon   # Monte Carlo chooser on
+#   LEARN=1   tools/regress.sh dungeon   # learned threat ledger on
+#   GEAR=0    tools/regress.sh dungeon   # equipment layer off
+# The learned ledger lives inside the scenario's own XDG dir, so one run never
+# teaches the next one.
 #
 # The playable save under work/xdg is never touched: each scenario gets its
 # own work/xdg-regress/<name> data dir, rebuilt from SAVE on every run.
+#
+# Exit codes from the bot: 0 success, 1 death, 3 timeout (in-game or wall
+# clock), 4 blocked (a finished level with no exit at all). Assertions decide
+# the scenario either way.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -71,7 +85,13 @@ for name in "${names[@]}"; do
     SAVE=""
     TIMEOUT=180
     SPEED=8
+    START_TOWN=""
+    MAPDUMP=""
+    PEACEFUL=""
     WALL=""
+    GEAR="${GEAR:-1}"
+    MODEL="${MODEL:-0}"
+    LEARN="${LEARN:-0}"
     ASSERT=()
     . "$conf"
 
@@ -92,14 +112,22 @@ for name in "${names[@]}"; do
 
     echo "regress[$name]: ${SAVE#$ROOT/} -> $DATA/save (timeout ${TIMEOUT}s, wall ${WALL}s)"
     set +e
-    timeout --signal=TERM "$WALL" \
+    timeout --signal=TERM --kill-after=20s "$WALL" \
       env XDG_DATA_HOME="$XDG" \
           ZZBOT_HEADLESS=1 \
           ZZBOT_AUTOSTART=1 \
           ZZBOT_START_ON=1 \
           ZZBOT_QUIT=1 \
           ZZBOT_TIMEOUT="$TIMEOUT" \
+          ZZBOT_WALL="$WALL" \
           ZZBOT_SPEED="$SPEED" \
+          ZZBOT_START_TOWN="$START_TOWN" \
+          ZZBOT_MAPDUMP="${MAPDUMP:-}" \
+          ZZBOT_PEACEFUL="${PEACEFUL:-}" \
+          ZZBOT_GEAR="${GEAR:-}" \
+          ZZBOT_MODEL="${MODEL:-}" \
+          ZZBOT_LEARN="${LEARN:-}" \
+          ZZBOT_KNOWLEDGE="$XDG/knowledge.lua" \
           ZZBOT_LOG="$LOG" \
       "$ROOT/tools/run.sh" >/dev/null 2>&1
     rc=$?
@@ -109,6 +137,7 @@ for name in "${names[@]}"; do
       0)   echo "regress[$name]: exited cleanly" ;;
       1)   echo "regress[$name]: exited on player death (rc=1)" ;;
       3)   echo "regress[$name]: exited on timeout (rc=3)" ;;
+      4)   echo "regress[$name]: exited blocked with no way out (rc=4)" ;;
       124) echo "regress[$name]: killed at wall-clock limit (rc=124)" ;;
       *)   echo "regress[$name]: exit code $rc" ;;
     esac

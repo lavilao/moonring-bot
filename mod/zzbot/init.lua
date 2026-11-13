@@ -86,6 +86,14 @@ local CFG = {
   learn     = (os.getenv("ZZBOT_LEARN") == "1"),
   knowledgePath = os.getenv("ZZBOT_KNOWLEDGE"),
   policy    = os.getenv("ZZBOT_POLICY") or "base",
+  -- Hard wall-clock deadline for the harness: the in-game timeout only
+  -- advances while the bot owns the tick, so a soft-locked run could
+  -- otherwise outlive the runner's own timeout.
+  wall      = tonumber(os.getenv("ZZBOT_WALL")),
+  -- Test-only: send every hostile on a newly entered level away, so loot,
+  -- descent and exit logic can be exercised without a combat outcome. Never
+  -- enabled by the campaign scenarios; used by the multi-level regression.
+  peaceful  = (os.getenv("ZZBOT_PEACEFUL") == "1"),
 }
 
 local S = {
@@ -284,6 +292,7 @@ local function pressKey(key)
 end
 
 local function cellAt(map, x, y)
+  if x == nil or y == nil then return nil end
   return map.cells[y + 1] and map.cells[y + 1][x + 1]
 end
 
@@ -331,6 +340,30 @@ DATA.BREAKABLE_OBSTACLES = {
   crateClosed = true, crateOpen = true,
   barrelClosed = true, barrelOpen = true,
 }
+
+-- Traps and environmental damage the pathfinder walks around. Holes are
+-- instant death at the bottom of a dungeon and skip the rest of the floor on
+-- the way down; a fire trap costs a large chunk of health and permanent poise
+-- damage per trigger, and an amber trap drains the lamp in a dark level.
+-- Spike cells are deliberately *not* here: the game cycles them on a timer
+-- (state_game.lua:8889) and whole rooms are tiled with them, so treating them
+-- as walls strands the sweep. Timing them is a later-phase problem.
+DATA.HAZARD_CELLS = {
+  trapdoorClosed = true, trapdoorOpen = true, void = true,
+  trap = true, lava = true, staticFire = true, fire = true,
+}
+DATA.HAZARD_PREFIXES = { "fireTrap", "amberTrap" }
+
+-- Kept on DATA: the chunk is at the 200-local ceiling, so a helper local here
+-- would push it over.
+function DATA.isHazardCellName(name)
+  if not name then return false end
+  if DATA.HAZARD_CELLS[name] then return true end
+  for _, prefix in ipairs(DATA.HAZARD_PREFIXES) do
+    if name:sub(1, #prefix) == prefix then return true end
+  end
+  return false
+end
 
 local function isBumpableObstacleName(name)
   return isBumpableDoorName(name) or DATA.BREAKABLE_OBSTACLES[name] == true
@@ -387,7 +420,101 @@ function Loot.fingerprint(game)
 end
 
 local function isPassableForPath(cell)
-  return cellWalkable(cell) or isBumpableObstacleName(cellTypeName(cell))
+  local name = cellTypeName(cell)
+  if name == "doorLocked2" then return false end
+  if DATA.isHazardCellName(name) then return false end
+  return cellWalkable(cell) or isBumpableObstacleName(name)
+end
+
+-- Hidden traps. The game stores them as `fnTrap` triggers on ordinary floor
+-- cells (state_game.lua:2156) and only draws them after a perception check, so
+-- the cell name says nothing. A trap costs a quarter of max health and
+-- permanently breaks poise, so routes pay a large penalty to cross one and
+-- still cross it when it sits in the only corridor. Rebuilt per level.
+DATA.TRAP_PENALTY = {}
+DATA.TRAP_STEP_COST = 60
+
+function DATA.rebuildTrapPenalty(game)
+  local set = {}
+  local ok, traps = pcall(function()
+    return game.triggerData:getAllTriggersOnLevelWithActionName(
+      game.currentWorldName, "fnTrap")
+  end)
+  if ok and traps then
+    for _, t in ipairs(traps) do
+      local mx, my = toMapXY(game, t.x, t.y)
+      set[ckey(mx, my)] = DATA.TRAP_STEP_COST
+    end
+  end
+  DATA.TRAP_PENALTY = set
+end
+
+-- Spike fields are ordinary walkable terrain that the game flips on a
+-- 24-turn cycle (state_game.lua:8886): up at 1-2 and 11-12, down at 3-10,
+-- 13-23 and 0. A rise under the player costs a quarter of max health
+-- (actor.lua:8170), so a run of spike cells is only entered when the current
+-- down window can clear it, and the player never sits on one through a rise.
+function DATA.isSpikeCellName(name)
+  if not name then return false end
+  if name == "trapSpikesOn" or name == "trapSpikesOff" then return true end
+  return name:sub(1, 11) == "floorSpikes"
+end
+
+function DATA.spikesUp(game)
+  local t = (game.spikeTime or 0) % 24
+  return t == 1 or t == 2 or t == 11 or t == 12
+end
+
+-- Turns of safe window left before the spikes rise again (0 while they are up).
+function DATA.spikeDownTurns(game)
+  local t = (game.spikeTime or 0) % 24
+  if t == 1 or t == 2 or t == 11 or t == 12 then return 0 end
+  local rise = (t >= 13 or t == 0) and 1 or 11
+  return (rise - t) % 24
+end
+
+-- Returns true when it consumed the tick: stepped off a spike field before a
+-- rise, or waited on solid floor for the next down window.
+function DATA.spikeGuard(game, player, steps, px, py)
+  if type(px) ~= "number" or type(py) ~= "number" then return false end
+  local map = game.map
+  local here = DATA.isSpikeCellName(cellTypeName(cellAt(map, px, py)))
+  local nextSpike = DATA.isSpikeCellName(cellTypeName(
+    cellAt(map, px + steps[1].x, py + steps[1].y)))
+  if not here and not nextSpike then return false end
+  local down = DATA.spikeDownTurns(game)
+  if here and down <= 1 then
+    -- Riding a rise costs 25% max health: step to any adjacent solid cell.
+    for _, d in ipairs(DATA.DIRS) do
+      local ax, ay = px + d[1], py + d[2]
+      if inBounds(map, ax, ay) then
+        local cell = cellAt(map, ax, ay)
+        if isPassableForPath(cell)
+          and not DATA.isSpikeCellName(cellTypeName(cell)) then
+          pressDelta(d[1], d[2])
+          S.phase = "leave-spikes"
+          return true
+        end
+      end
+    end
+  end
+  if nextSpike and not here then
+    local run, x, y = 0, px, py
+    for i = 1, #steps do
+      x, y = x + steps[i].x, y + steps[i].y
+      if DATA.isSpikeCellName(cellTypeName(cellAt(map, x, y))) then
+        run = run + 1
+      else
+        break
+      end
+    end
+    if down < run + 1 then
+      pressKey("space")
+      S.phase = "wait-spikes"
+      return true
+    end
+  end
+  return false
 end
 
 -- One movement delta toward world (wx, wy) on the overworld. The BFS runs over
@@ -645,7 +772,13 @@ local function weightedSteps(game, player, tx, ty, opts)
                   and not (blocked and blocked[nk] and not isTarget)
                   and (isTarget or not (S.avoidDanger and S.avoidDanger[nk])) then
                   local stepCost = 1
-                  if pen and not isTarget then stepCost = stepCost + (pen[nk] or 0) end
+                  if not isTarget then
+                    stepCost = stepCost + (DATA.TRAP_PENALTY[nk] or 0)
+                    if DATA.isSpikeCellName(cellTypeName(cell)) then
+                      stepCost = stepCost + 8
+                    end
+                    if pen then stepCost = stepCost + (pen[nk] or 0) end
+                  end
                   if opts.avoidWeb and cellTypeName(cell) == "web" then
                     stepCost = stepCost + 6
                   end
@@ -727,10 +860,21 @@ local function isKnown(x, y)
 end
 
 -- Nearest known walkable cell that borders something we have never seen.
--- Returns the target plus the nav steps that reach it, or nil.
-local function findFrontier(game, player)
+-- Returns the target plus the nav steps that reach it, or nil. Cells listed in
+-- `blocked` are skipped: a frontier that stops revealing cells is a pocket
+-- behind a window or a one-way drop, and walking at it forever is how a sweep
+-- used to time out without ever reaching level_done.
+local function findFrontier(game, player, blocked)
   local map = game.map
   local sx, sy = playerPos(player)
+
+  local function passable(cell)
+    local name = cellTypeName(cell)
+    -- doorLocked2 is explicitly unpickable in the game. Never route into it.
+    -- Other lockable doors remain with the door objective/lockpick layers.
+    if name == "doorLocked2" then return false end
+    return isPassableForPath(cell)
+  end
 
   local function search(danger)
     local queue = { { sx, sy } }
@@ -754,7 +898,7 @@ local function findFrontier(game, player)
             -- bumping, and secret doors look like walls until touched. They
             -- must count as passable or whole rooms behind them are invisible
             -- to the frontier search.
-            if not seen[nk] and isPassableForPath(cellAt(map, nx, ny))
+            if not seen[nk] and passable(cellAt(map, nx, ny))
               and not (danger and danger[nk]) then
               seen[nk] = true
               queue[#queue + 1] = { nx, ny }
@@ -763,7 +907,8 @@ local function findFrontier(game, player)
         end
       end
 
-      if isFrontier and not (cx == sx and cy == sy) then
+      if isFrontier and not (cx == sx and cy == sy)
+        and not (blocked and blocked[ckey(cx, cy)]) then
         checked = checked + 1
         local steps = navSteps(game, player, cx, cy)
         if steps and steps[1] then
@@ -797,6 +942,7 @@ local function moveToward(game, player, tx, ty)
   local steps = travelSteps(game, player, tx, ty, true)
     or travelSteps(game, player, tx, ty, false)
   if steps and steps[1] then
+    if DATA.spikeGuard(game, player, steps, px, py) then return "moving" end
     local nx, ny = px + steps[1].x, py + steps[1].y
     if DATA.LOCKED_DOOR_CELLS[cellTypeName(cellAt(game.map, nx, ny))]
       and tryPickLock(game, player, nx, ny) then
@@ -1417,12 +1563,94 @@ local function useLS(game, player, wand, why)
   return useHealItem(game, player, wand)
 end
 
+-- Ailment cures (PLAN §3.2). The pack is scanned for the cures it can use
+-- right now; the choice of which ailment to clear lives in Gear.curePlan so
+-- it can be tested without the game. Anything that is not a cure item is
+-- never touched here: the potions of madness/stunning/poison are traps, and
+-- they are enemies of the bot exactly like they are of the player.
+DATA.CURE_FX = {
+  "cure_bleed", "cure_flame", "cure_poison", "cure_rot",
+  "cure_stun", "cure_torpor", "cure_blind", "cure_mad", "cure_deafness",
+  "cure_all",
+}
+
+DATA.AILMENTS = {
+  "isBleeding", "isAflame", "isPoisoned", "isRotting",
+  "isStunned", "isTorpid", "isBlind", "isMad", "isDeaf",
+}
+
+function DATA.cureStock(player)
+  local stock = {}
+  for _, fx in ipairs(DATA.CURE_FX) do
+    local ok, item = pcall(player.findInventoryObjectWithUseFX, player, fx)
+    if ok and item and (item.count or 0) > 0 then stock[fx] = item end
+  end
+  return stock
+end
+
+function DATA.ailmentNames(statuses)
+  local out = {}
+  for _, f in ipairs(DATA.AILMENTS) do
+    if statuses[f] then out[#out + 1] = (f:gsub("^is", ""):lower()) end
+  end
+  return table.concat(out, "+")
+end
+
+-- One cure per call: 12 ut buys a whole bleeding tick chain, so it is always
+-- worth the turn; the 2 s gate only stops a re-use from being issued while the
+-- game is still resolving the previous action.
+function DATA.cureStep(game, player)
+  if not Gear or not Gear.curePlan then return false end
+  if not player or not player.isFreeToMove or not player:isFreeToMove() then
+    return false
+  end
+  local t = now()
+  if t - (S.lastCureT or -100) < 2 then return false end
+  local statuses, any = {}, false
+  for _, f in ipairs(DATA.AILMENTS) do
+    if player[f] then statuses[f] = true; any = true end
+  end
+  if not any then return false end
+  S.lastCureT = t
+  local stock = DATA.cureStock(player)
+  local fx = Gear.curePlan(statuses, stock)
+  if not fx then
+    if t - (S.noCureT or -100) > 15 then
+      S.noCureT = t
+      local names = DATA.ailmentNames(statuses)
+      log("cure: nothing in the pack for %s", names)
+      ev("nocure", { ailment = names })
+    end
+    return false
+  end
+  local item = stock[fx]
+  -- P4 hook: the Dust may not drink potions or smear ointments (water is the
+  -- one exception); a cure that is sin stays in the pack.
+  local gprofile = Gods and Gods.get and Gods.get(CFG.god)
+  local veto = gprofile and Taboo and Taboo.check and Taboo.check(gprofile,
+    "heal", { itemType = item.objectType, category = item.category })
+  if veto then
+    ev("taboo_block", { kind = "heal", item = item.objectType or "",
+      reason = veto })
+    return false
+  end
+  local names = DATA.ailmentNames(statuses)
+  log("cure [%s] with %s (active %s, hp %d/%d)", fx,
+    tostring(item.objectType), names, player.health, player.maxHealth)
+  ev("cure", { fx = fx, ailment = names })
+  game:useItemWithInventoryIndex(item.ID)
+  return true
+end
+
 -- Healing is a trade: the Lifestone also heals every creature in the four
 -- cells around us, so its real value is the health we gain minus the extra
 -- health we must chew through (at our DPS) and the damage taken during the
 -- 12 ut the use action costs. Potions never help the enemy, but are finite.
 local function tryHeal(game, player)
   if player.maxHealth <= 0 or player.health <= 0 then return false end
+  -- Cures come before healing: bleeding eats the health a potion would restore
+  -- and also blocks natural regeneration, so the bandage is the cheaper fix.
+  if DATA.cureStep(game, player) then return true end
   local prof = playerProfile(game, player)
   local hp, maxhp = player.health, player.maxHealth
   local missing = maxhp - hp
@@ -1685,10 +1913,20 @@ local function doFlee(game, player, cell, why)
   if not (steps and steps[1]) then
     cell = desperateEscapeCell(game, player)
     if not cell then return false end
-    steps = { { x = cell.x, y = cell.y } }
+    -- travelSteps yields deltas; desperateEscapeCell yields a cell.
+    steps = { { x = cell.x - player.position.x, y = cell.y - player.position.y } }
     why = (why and (why .. ", one step")) or "one step"
   end
-  pressDelta(steps[1].x, steps[1].y)
+  if not pressDelta(steps[1].x, steps[1].y) then
+    -- pressDelta only knows the four unit directions. Returning true here used
+    -- to spin forever: newgame froze at 49,71 pressing nothing.
+    if now() - (S.fleeBlockT or 0) > 5 then
+      S.fleeBlockT = now()
+      log("flee: no unit direction (%d,%d) toward %d,%d",
+        steps[1].x, steps[1].y, cell.x, cell.y)
+    end
+    return false
+  end
   S.phase = "flee"
   if now() - (S.fleeLogT or 0) > 2 then
     S.fleeLogT = now()
@@ -1789,6 +2027,63 @@ local function poiseWaitTime(game, player)
   return delay + missing / (0.0125 * maxPoise)
 end
 
+-- Ranged is a real mechanic: G_Globals.keyRanged ("r") fires the
+-- "rangedWeapon" location action over whatever is in the ranged slot, with a
+-- reach of getFinalPlayerRange() (4 for the starting throwing stones), ammo
+-- counted from the equipped stack, damage from the weapon's physicalRangedDam
+-- and time from its weaponTimeCost. The bot fires the same action without the
+-- targeting overlay by setting targetedOffset and calling
+-- performPendingActionAtTargetLocation. Accuracy is the game's
+-- rangedAngleVariance scaled by perception, so a low-damage rock at range is
+-- often a miss; the model prices that as the damage it supplies.
+function DATA.rangedInfo(game, player)
+  local wid = player and player.rangedInventoryID
+  if not wid or wid == 0 then return nil end
+  local ok, ammo = pcall(function() return player:getAmmoForCurrentRangedWeapon() end)
+  if not ok or not ammo or ammo <= 0 then return nil end
+  local data
+  pcall(function() data = player:getRangedWeaponData() end)
+  if type(data) ~= "table" then return nil end
+  local range
+  pcall(function() range = player:getFinalPlayerRange() end)
+  range = math.max(1, math.min(6, tonumber(range) or data.range or 4))
+  local dmg = 0
+  if CActions and CActions.getRangedAverageDamage then
+    local okd, p = pcall(CActions.getRangedAverageDamage, data)
+    if okd then dmg = tonumber(p) or 0 end
+  end
+  if dmg <= 0 then dmg = math.ceil((data.physicalRangedDam or 0) * 0.75) end
+  if dmg <= 0 then return nil end
+  return {
+    range = range, damage = dmg,
+    time = tonumber(data.weaponTimeCost) or 12,
+    ammo = ammo, name = data.name or data.objectType,
+  }
+end
+
+-- Enemies the equipped ranged weapon can actually reach right now. Both the
+-- action set and the decision window use this, so the window never opens with
+-- nothing to shoot: a wall between us and a target inside range would leave
+-- only wait/retreat and the bot idled until the clock ran out.
+function DATA.rangedTargets(game, player, near)
+  local ri = DATA.rangedInfo(game, player)
+  if not ri then return nil end
+  local out = {}
+  for _, w in ipairs(near) do
+    local d = w.dist or 99
+    if w.actor and w.actor.position and d >= 1 and d <= ri.range + 0.01 then
+      local clear = false
+      pcall(function()
+        clear = player:getLOMToWorldXY(w.actor.position.x, w.actor.position.y,
+                                       false, false) and true or false
+      end)
+      if clear then out[#out + 1] = w end
+    end
+  end
+  if #out == 0 then return nil end
+  return ri, out
+end
+
 local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
                                   nPot, bestPot, wand, charges, fleeWanted)
   local actions, pidx = {}, {}
@@ -1805,6 +2100,22 @@ local function buildCombatOptions(game, player, prof, adj, near, pack, deadEnd,
       time = prof.attackTime, label = "hit:" .. tostring(w.actorType),
       resourceCost = 0,
     }
+  end
+
+  -- Thrown or fired weapons compete with the melee swing outside arm's reach.
+  -- Ammo is finite, so the charge is priced as a resource like a potion.
+  local ri, shootable = DATA.rangedTargets(game, player, near)
+  if ri then
+    for _, w in ipairs(shootable) do
+      if pidx[w] then
+        actions[#actions + 1] = {
+          kind = "shoot", target = pidx[w], ref = w, range = ri.range,
+          damage = ri.damage, time = ri.time,
+          label = "shoot:" .. tostring(w.actorType),
+          resourceCost = 0.05 * val,
+        }
+      end
+    end
   end
 
   if nPot > 0 and missing > 0 then
@@ -2041,6 +2352,29 @@ local function executeChoice(game, player, prof, chosen, near)
       S.phase = "heal"
       return drinkPotion(game, player)
     end
+  elseif a.kind == "shoot" then
+    local w = a.ref
+    if w and w.actor and w.actor.position then
+      local fired = false
+      pcall(function()
+        player.targetedOffset:set(w.actor.position.x - px, w.actor.position.y - py)
+        player:performPendingActionAtTargetLocation({
+          id = "rangedWeapon", distance = a.range or 4, radius = 1,
+          noPrediction = true, playerDoesNotBlockTarget = false,
+          isBlockedByWalls = true,
+        })
+        fired = true
+      end)
+      if fired then
+        ev("shoot", {
+          target = tostring(w.actorType), dist = w.dist, dmg = a.damage,
+          range = a.range,
+        })
+        S.phase = "combat"
+        S.holdSinceTurn = nil
+        return true
+      end
+    end
   elseif a.kind == "wait" then
     pressKey("space")
     S.phase = "wait-poise"
@@ -2140,10 +2474,15 @@ local function combatStep(game, player)
   local fleeWanted = S.exitReady or v == "avoid"
     or player.health <= math.floor(player.maxHealth * 0.3)
   -- The model's action set prices contact decisions (hit, heal, flee, wait,
-  -- choke); approach and avoidance at range belong to the movement layer
+  -- choke); approach and long-range movement belong to the movement layer
   -- below. Running it with nothing adjacent once made a distant wolf's
-  -- approach into an excuse to burn Lifestone charges at full health.
-  if Model and CFG.model and (S.modelErrors or 0) < 5 and #adj > 0 then
+  -- approach into an excuse to burn Lifestone charges at full health, so the
+  -- no-contact window opens only when a ranged weapon can actually be used.
+  local modelWindow = #adj > 0
+  if not modelWindow and Model and CFG.model and DATA.rangedTargets then
+    modelWindow = DATA.rangedTargets(game, player, near) ~= nil
+  end
+  if Model and CFG.model and (S.modelErrors or 0) < 5 and modelWindow then
     local chosen, evals, reason = modelChoose(game, player, prof, adj, near,
       deadEnd, nPot, bestPot, wand, charges, emergency, fleeWanted)
     if chosen then
@@ -3059,7 +3398,31 @@ function Loot.sweepStep(game, player)
       end
     end
   end
-  if not best then return false end
+  if not best then
+    S.sweepBestKey, S.sweepBestLen, S.sweepBestAt = nil, nil, nil
+    return false
+  end
+  -- Stall watchdog. A pending container whose plan never shortens is behind a
+  -- window, a sealed door or a one-way drop: bumping at it forever starves
+  -- the rest of the level and keeps the floor from ever finishing. Annotate
+  -- it (which removes it from the blocking set) and replan.
+  local bkey = ckey(best.c.x, best.c.y)
+  local same = S.sweepBestKey == bkey and bestLen >= (S.sweepBestLen or math.huge)
+  if same then
+    if now() - (S.sweepBestAt or now()) > 20 then
+      best.c.problem = "stalled"
+      ev("container_skip", {
+        world = name, x = best.c.x, y = best.c.y, cell = tostring(best.c.cell),
+        reason = "stalled", path = bestLen,
+      })
+      log("loot: %s at %d,%d makes no progress (path %d); leaving it for the exit report",
+        tostring(best.c.cell), best.c.x, best.c.y, bestLen)
+      S.sweepBestKey, S.sweepBestLen, S.sweepBestAt = nil, nil, nil
+      return false
+    end
+  else
+    S.sweepBestKey, S.sweepBestLen, S.sweepBestAt = bkey, bestLen, now()
+  end
   if bestLen > 0
     and Loot.lockedAhead(game, player.position.x, player.position.y, best.steps) then
     return false
@@ -3088,15 +3451,140 @@ function Loot.stairsStep(game, player, action, phase)
     game.currentWorldName, action)
   if not sx then return false end
   local px, py = playerPos(player)
+  local key = tostring(game.currentWorldName) .. ":" .. tostring(action)
+  local rootHere = cellTypeName(cellAt(game.map, px, py))
+  local rootTarget = cellTypeName(cellAt(game.map, sx, sy))
+  local route = travelSteps(game, player, sx, sy, true)
+    or travelSteps(game, player, sx, sy, false)
+  local first = route and route[1]
+  local step = first and string.format("%d,%d", first.x, first.y) or "none"
+  local stepRoot = first and cellTypeName(cellAt(game.map,
+    px + first.x, py + first.y)) or "none"
+  local triggerData, startData
+  pcall(function()
+    local t = game.triggerData:getFirstTriggerOnLevelWithActionNameAtXYZeroIndexed(
+      game.currentWorldName, sx, sy, action)
+    triggerData = t and t.data
+    local p = game.triggerData:getFirstTriggerOnLevelWithActionNameAtXYZeroIndexed(
+      game.currentWorldName, sx, sy, "playerStart")
+    startData = p and p.data
+  end)
+  local dist = math.max(math.abs(px - sx), math.abs(py - sy))
+  local st = S.stairs
+  local t = now()
+  if not st or st.key ~= key then
+    st = { key = key, px = px, py = py, progressAt = t,
+      tries = 0, logAt = 0, lastResult = "start" }
+    S.stairs = st
+  elseif st.px ~= px or st.py ~= py then
+    st.px, st.py, st.progressAt = px, py, t
+  end
+
+  local function diag(result, sent)
+    if st.lastResult == result and t - (st.logAt or 0) < 2 then return end
+    st.lastResult, st.logAt = result, t
+    log("stairs: %s %s p=%d,%d target=%d,%d d=%d here=%s targetRoot=%s data=%s start=%s step=%s stepRoot=%s result=%s sent=%s",
+      tostring(game.currentWorldName), action, px, py, sx, sy, dist,
+      tostring(rootHere), tostring(rootTarget), tostring(triggerData),
+      tostring(startData), step, tostring(stepRoot), tostring(result),
+      tostring(sent or "none"))
+    ev("stairs_diag", {
+      world = game.currentWorldName, action = action, phase = phase,
+      px = px, py = py, sx = sx, sy = sy, dist = dist,
+      root_here = tostring(rootHere), root_target = tostring(rootTarget),
+      trigger_data = tostring(triggerData), start_data = tostring(startData),
+      step = step, step_root = tostring(stepRoot),
+      result = tostring(result), sent = tostring(sent or "none"),
+    })
+  end
+
   if px == sx and py == sy then
-    pressKey("return")
+    -- Return is the game's dispatcher for fnDown/fnUp: it checks the stair
+    -- root and the playerStart trigger underfoot before changing the world.
+    -- Retry a swallowed input at a bounded interval, then fail visibly rather
+    -- than pinning the campaign forever on the stair.
+    if t - (st.lastPressAt or -100) >= 2 then
+      if st.tries >= 5 then
+        diag("failed", "none")
+        ev("stairs_failed", {
+          world = game.currentWorldName, action = action, sx = sx, sy = sy,
+          root = tostring(rootHere), tries = st.tries,
+        })
+        return false
+      end
+      st.tries = st.tries + 1
+      st.lastPressAt = t
+      diag("arrived", "return")
+      pressKey("return")
+    else
+      diag("arrived_wait", "none")
+    end
     S.phase = phase
     return true
   end
-  if navigateOrOpenDoor(game, player, sx, sy) ~= "nopath" then
+
+  -- A locked door between the player and the stairs is a key problem, not a
+  -- walking problem: pressing into it burns turns until the harness timeout.
+  -- Decline the tick so the door objective (key carrier, key chest, plate)
+  -- and the blocked report get it. With the key in hand (or the master key)
+  -- lockedDoorPlan returns nil and the stairs are walked to as usual.
+  if first then
+    local doorX, doorY = px + first.x, py + first.y
+    local plan = lockedDoorPlan(game, player, doorX, doorY)
+    if plan and plan ~= "pick" then
+      S.stairsLocked = { need = plan, x = doorX, y = doorY, action = action }
+      diag("door_locked", "none")
+      return false
+    end
+  end
+  S.stairsLocked = nil
+
+  local result = navigateOrOpenDoor(game, player, sx, sy)
+  local sent = "none"
+  if result == "moving" then sent = "delta"
+  elseif result == "door" then sent = "door_delta" end
+  diag(result, sent)
+
+  -- A path-planner result is not proof of movement: if the game cannot move
+  -- (closed floor door, wrong coordinate, etc.), navigateOrOpenDoor can keep
+  -- returning "moving"/"door" while the actor remains free at the same cell.
+  -- Measure position change, not the return string.
+  if (result == "moving" or result == "door")
+    and t - (st.progressAt or t) >= 5 then
+    if not st.stallReported then
+      st.stallReported = true
+      ev("stairs_stall", {
+        world = game.currentWorldName, action = action, phase = phase,
+        px = px, py = py, sx = sx, sy = sy,
+        root_here = tostring(rootHere), root_target = tostring(rootTarget),
+        trigger_data = tostring(triggerData), start_data = tostring(startData),
+        result = tostring(result), idle = math.floor(t - st.progressAt),
+      })
+      log("stairs stall: %s %s p=%d,%d target=%d,%d result=%s idle=%ds",
+        tostring(game.currentWorldName), action, px, py, sx, sy,
+        tostring(result), math.floor(t - st.progressAt))
+    end
+    return false
+  end
+
+  if result == "moving" or result == "door" or result == "arrived" then
     S.phase = phase
     return true
   end
+
+  -- Diagnose a path planner that reports work but leaves the player stationary.
+  if t - (st.progressAt or t) >= 5 then
+    diag("no_progress", "none")
+    ev("stairs_stall", {
+      world = game.currentWorldName, action = action, phase = phase,
+      px = px, py = py, sx = sx, sy = sy,
+      root_here = tostring(rootHere), root_target = tostring(rootTarget),
+      trigger_data = tostring(triggerData), start_data = tostring(startData),
+      result = tostring(result), idle = math.floor(t - st.progressAt),
+    })
+    return false
+  end
+  diag(result, "none")
   return false
 end
 
@@ -3112,10 +3600,15 @@ end
 -- between the bot and the exit. Chase the nearest hostile, visible or not:
 -- the boss level has no stairs down, and the key only drops when it dies.
 function Loot.huntStep(game, player)
+  -- Only chase what we can actually reach. A guardian behind a pit or a
+  -- sealed door used to absorb every tick of the hunt, which reads in the log
+  -- as progress but never lands a hit.
   local best, bestD
+  local unreachable = S.huntUnreachable or {}
   for _, a in ipairs(game.actorManager.actorArray) do
     if a.ID ~= player.ID and not a.isCorpse and a.fallingTime == 0
-      and a.isAway ~= true and a:isKillable() and player:isEnemy(a) then
+      and a.isAway ~= true and a:isKillable() and player:isEnemy(a)
+      and not (unreachable[a.ID] and now() - unreachable[a.ID] < 20) then
       local d = math.max(math.abs(a.position.x - player.position.x),
         math.abs(a.position.y - player.position.y))
       if bestD == nil or d < bestD then best, bestD = a, d end
@@ -3126,6 +3619,18 @@ function Loot.huntStep(game, player)
     S.huntTarget = best.actorType
     log("hunt: chasing %s at %d,%d (dist %d)",
       tostring(best.actorType), best.position.x, best.position.y, bestD)
+  end
+  local ax, ay = best.position.x, best.position.y
+  if not Loot.plan(game, player, ax, ay) then
+    S.huntUnreachable = S.huntUnreachable or {}
+    S.huntUnreachable[best.ID] = now()
+    log("hunt: %s at %d,%d is not reachable; ignoring it for 20s",
+      tostring(best.actorType), best.position.x, best.position.y)
+    ev("hunt_skip", {
+      world = game.currentWorldName, actor = tostring(best.actorType),
+      x = best.position.x, y = best.position.y, reason = "unreachable",
+    })
+    return false
   end
   if moveToActor(game, player, best) then
     S.phase = "hunt"
@@ -3140,6 +3645,59 @@ local function findActionTrigger(game, action, data)
   for _, t in ipairs(list) do
     if data == nil or t.data == data then return t end
   end
+end
+
+-- Dungeon-entrance pass-phrases. Some doors carry a lock trigger that no
+-- inventory item opens: the Jest's door in Harrowdus answers only to its
+-- phrase, which the game's own guides assemble from five clues around Caldera
+-- (a Red Grove book, the Wintersholl trees, the Four Lake Meet stone, a
+-- Hearthaven note and the graves of Moon-upon-Thoss). The trigger on the door
+-- cell reads "Death_Has_Dominion_Over_All", and fnShout matches those words
+-- (spaces become underscores), so the phrase is campaign data rather than
+-- something read out of the trigger at runtime.
+local ENTRANCE_PHRASES = {
+  ["dungeon2-01"] = "Death Has Dominion Over All",
+}
+
+-- Yell the pass-phrase at a sealed dungeon entrance. Returns true when the tick
+-- was used (the shout itself, or standing next to the gate ready to shout).
+local function unlockEntranceStep(game, player, town, dungeon, sx, sy)
+  local lock = game.triggerData:getFirstTriggerOnLevelWithActionNameAtXYZeroIndexed(
+    town, sx, sy, "lock")
+  -- The game removes the lock trigger when the phrase is accepted; report the
+  -- success once so the log (and check_log) can prove the door opened.
+  if S.yellDungeon == dungeon and not lock then
+    S.yellDungeon = nil
+    log("entrance unlocked: %s", tostring(dungeon))
+    ev("entrance_unlocked", { world = town, dungeon = dungeon, x = sx, y = sy })
+    return false
+  end
+  if not lock then return false end
+  if lock.data and player:findInventoryObjectWithName(lock.data) then return false end
+  local phrase = ENTRANCE_PHRASES[dungeon]
+  local px, py = playerPos(player)
+  if phrase and math.max(math.abs(px - sx), math.abs(py - sy)) <= 1
+    and now() - (S.yellAt or 0) > 2 then
+    S.yellAt = now()
+    S.yellDungeon = dungeon
+    log("yell: '%s' at the %s entrance", phrase, tostring(dungeon))
+    ev("yell", {
+      world = town, x = sx, y = sy, dungeon = dungeon, phrase = phrase,
+    })
+    local ok, err = pcall(game.fnShout, game, phrase)
+    if not ok then log("yell failed: %s", tostring(err)) end
+    return true
+  end
+  if not phrase and S.lockedEntrance ~= dungeon then
+    S.lockedEntrance = dungeon
+    log("BLOCKED: %s entrance at %d,%d is sealed and no phrase is known (needs %s)",
+      tostring(dungeon), sx, sy, tostring(lock.data or "a pass-phrase"))
+    ev("dungeon_blocked", {
+      world = town, x = sx, y = sy, dungeon = dungeon,
+      reason = "entrance_sealed",
+    })
+  end
+  return false
 end
 
 -- Gods: the gods screen is game.skillTree, and every purchase the UI makes is
@@ -3505,23 +4063,11 @@ end
 -- objects to the pure zzbot.gear records; every read is a pcall, so a missing
 -- column simply leaves the field nil and the scorer ignores that item.
 local function gearRecord(game, o)
+  if not (Gear and Gear.fromObjectData) then return nil end
   local def
   pcall(function() def = game:getObjectDataWithObjectType(o.objectType) end)
-  if not def then return nil end
-  local r = {
-    ID = o.ID, category = o.category, objectType = o.objectType,
-    price = tonumber(def.price) or 0, identified = true,
-  }
-  pcall(function()
-    r.damage = tonumber(def.damage)
-    r.timeCost = tonumber(def.weaponTimeCost) or tonumber(def.timeCost)
-    r.might = tonumber(def.mightBonus) or tonumber(def.might)
-    r.defense = tonumber(def.defense)
-    r.burden = tonumber(def.burden)
-    r.block = tonumber(def.shieldBlockFraction) or tonumber(def.block)
-    r.hands = tonumber(def.hands)
-    r.weight = tonumber(def.weight)
-  end)
+  local r = Gear.fromObjectData(o, def)
+  if not r then return nil end
   pcall(function() r.identified = game:isObjectDataIdentified(def) ~= false end)
   return r
 end
@@ -3552,21 +4098,38 @@ local function equipStep(game, player)
     end
   end
   local profile = Gods and Gods.get and Gods.get(CFG.god)
-  local plan = Gear.planEquip(records, {
+  local plan, skipped = Gear.planEquip(records, {
     worn = worn,
-    -- P4 taboo hook: a heavy weapon never reaches the Harlequin's hands.
-    allowed = profile and function(r)
-      local veto = Taboo and Taboo.check and Taboo.check(profile, "equip", r)
+    -- Ranged lives in its own slot, so wielding one never costs melee damage,
+    -- but only the model knows how to fire it: without `ZZBOT_MODEL` the
+    -- heuristic never shoots, so equipping a ranged weapon would just add
+    -- noise to the default run. P4 taboo hook: a heavy weapon never reaches
+    -- the Harlequin's hands.
+    allowed = function(r)
+      if r.category == "ranged" and not CFG.model then
+        return "ranged unused without the model"
+      end
+      local veto = profile and Taboo and Taboo.check
+        and Taboo.check(profile, "equip", r)
       if veto then
         ev("taboo_block", {
           kind = "equip", item = r.objectType or "", reason = veto,
         })
       end
       return veto
-    end or nil,
+    end,
   })
   local swap = plan[1]
-  if not swap then return false end
+  if not swap then
+    -- Once per level is enough to tell a real "nothing to wear" from a broken
+    -- adapter: a live login should show a non-zero record count here.
+    if S.gearScanWorld ~= game.currentWorldName then
+      S.gearScanWorld = game.currentWorldName
+      log("gear: no upgrade among %d wearable records (%d vetoed)",
+        #records, #(skipped or {}))
+    end
+    return false
+  end
   local target
   for _, o in pairs(inv) do
     if o.ID == swap.to then target = o break end
@@ -3609,7 +4172,10 @@ local function lampStep(game, player)
   end
   local plan = Gear.lampPlan({
     allowAmber = allowAmber, hasLamp = lamp ~= nil, fuel = fuel or 0,
-    lampOn = S.lampOn or false, inDark = S.entered == true,
+    -- The game owns this state: it snuffs the ward on sneak and re-lights it
+    -- on stand, so a bot-side flag drifts away from the truth.
+    lampOn = (player.lampInventoryID or 0) ~= 0,
+    inDark = S.entered == true,
   })
   if not plan then return false end
   if plan.supply then
@@ -3623,16 +4189,36 @@ local function lampStep(game, player)
     return false -- the supply run stays the supply step's job
   end
   if plan.toggle and lamp then
-    local ok = pcall(function() game:toggleInventoryID(lamp.ID) end)
-    if ok then
-      S.lampOn = not (S.lampOn or false)
-      log("lamp: turned %s (fuel %s)", S.lampOn and "on" or "off", tostring(fuel))
+    -- The inventory panel toggles a wearable slot through
+    -- player:toggleInventoryID(locationID, id); the lamp is worn in
+    -- lampInventoryID. A pcall alone proves nothing: updateLampStatus returns
+    -- silently when it cannot find the lamp, so read the slot back.
+    local wasLit = (player.lampInventoryID or 0) ~= 0
+    local ok = pcall(function()
+      player:toggleInventoryID("lampInventoryID", lamp.ID)
+      game:updateLampStatus((player.lampInventoryID or 0) ~= 0)
+    end)
+    local isLit = (player.lampInventoryID or 0) ~= 0
+    if ok and isLit ~= wasLit then
+      S.lampOn = isLit
+      log("lamp: turned %s (fuel %s)", isLit and "on" or "off", tostring(fuel))
       ev("amber_state", {
-        state = S.lampOn and "lit" or "snuffed", fuel = fuel or 0,
+        state = isLit and "lit" or "snuffed", fuel = fuel or 0,
         world = game.currentWorldName,
       })
       return true
     end
+    if now() - (S.lampFailT or 0) > 30 then
+      S.lampFailT = now()
+      log("lamp: toggle did not take (id=%s slot=%s ok=%s) in %s",
+        tostring(lamp.ID), tostring(player.lampInventoryID), tostring(ok),
+        tostring(game.currentWorldName))
+      ev("amber_state", {
+        state = "toggle_failed", fuel = fuel or 0, ok = tostring(ok),
+        world = game.currentWorldName,
+      })
+    end
+    return false
   end
   return false
 end
@@ -3729,7 +4315,11 @@ local function walkNextToActor(game, player, actor)
     end
   end
   if not best then return false end
-  pressDelta(best[1].x, best[1].y)
+  if not pressDelta(best[1].x, best[1].y) then
+    log("shop: walkNextToActor cannot press (%d,%d) from %d,%d vendor %d,%d steps=%d",
+      best[1].x, best[1].y, player.position.x, player.position.y, ax, ay, #best)
+    return false
+  end
   return true
 end
 
@@ -4754,6 +5344,19 @@ local function dumpMap(game, tag)
     end
     f:write(table.concat(row), "\n")
   end
+  -- Liquid stubs ("J", "K", ...) are not interesting in this dump; stairs,
+  -- locks and warps are. Printing them makes a stall at a door readable
+  -- without a debugger attached to the running game.
+  local interesting = {
+    fnUp = true, fnDown = true, locked_door = true, unlocked = true,
+    lock = true, warp = true, object = true,
+  }
+  for _, t in ipairs(game.triggerData:getAllTriggersOnLevel(game.currentWorldName) or {}) do
+    if interesting[t.action] then
+      f:write(string.format("TRIGGER %s %d,%d data=%s\n", tostring(t.action),
+        t.x, t.y, tostring(t.data)))
+    end
+  end
   f:close()
 end
 
@@ -4795,9 +5398,85 @@ local function markDungeonComplete(game, dungeonName)
   end
 end
 
+-- Test-only: mark every hostile on the level as away. Called on entry and
+-- once a second after that so spawned guardians do not break a peaceful test.
+local function peacefulSweep(game, player)
+  if not CFG.peaceful then return 0 end
+  local n, keys = 0, 0
+  for _, a in ipairs(game.actorManager.actorArray) do
+    if a.ID ~= player.ID and not a.isPlayer and not a.isFollowingPlayer
+      and player:isEnemy(a) and a.isAway ~= true then
+      -- Dungeon keys (and the chest key) live on the boss/minibosses as
+      -- carryingObject. Sending the carrier away would delete the only copy,
+      -- leaving the stair door sealed and the floor impossible, so hand the
+      -- drop to the player first. Test-only, like the sweep itself.
+      local carried = a.carryingObject
+      if type(carried) == "string" and carried ~= "" and carried ~= "nothing" then
+        local ok = pcall(function()
+          player:addObjectToInventory(carried, 1, false)
+        end)
+        if ok then keys = keys + 1 end
+        a.carryingObject = nil
+      end
+      a.isAway = true
+      n = n + 1
+    end
+  end
+  S.peacefulKeys = (S.peacefulKeys or 0) + keys
+  return n
+end
+
+-- Shared helper bundle for tickWorld, hung off DATA so it costs no extra
+-- top-level local (this chunk sits against the 200-local ceiling) and so the
+-- function's upvalue list stays under the 60-slot Lua limit.
+DATA.W = {
+  CFG   = CFG,
+  S     = S,
+  Loot  = Loot,
+  log   = log,
+  ev    = ev,
+  now   = now,
+  ckey  = ckey,
+}
+
+-- Facts the dungeon-entry banner needs: the equipped melee weapon and a
+-- one-line inventory summary. Kept in a top-level helper so tickWorld does
+-- not need two nested closures: their captured variables are what push its
+-- upvalue list past the engine's 60-slot limit.
+--
+-- It also preserves one top-level local slot per call site: this chunk sits
+-- against the 200-local-variable ceiling, so W_TICKS and the alias locals are
+-- folded in here instead of declared as new top-level names.
+local function enteredBanner(game, player)
+  local wd
+  pcall(function() wd = player:getMeleeWeaponData() end)
+  local inv = {}
+  pcall(function()
+    for _, o in pairs(game:getPlayerInventory() or {}) do
+      inv[#inv + 1] = string.format("%s x%s", tostring(o.objectType), tostring(o.count or 1))
+    end
+  end)
+  return wd and wd.objectType or "none", table.concat(inv, ", ")
+end
+
 local function tickWorld(game, player)
   local name = game.currentWorldName
   local data = game.currentWorldData
+
+  -- Local aliases route through the top-level table: the helpers cost one table
+  -- read plus one register each instead of one upvalue entry per helper.
+  local CFG = DATA.W.CFG
+  local S = DATA.W.S
+  local Loot = DATA.W.Loot
+  local DATA = DATA
+  local log = DATA.W.log
+  local ev = DATA.W.ev
+  local now = DATA.W.now
+  local ckey = DATA.W.ckey
+
+  -- Local aliases for the shared local context table: these are one register
+  -- each, so any nested function defined in this body stays well under the
+  -- upvalue budget.
 
   if name ~= S.world then
     S.world = name
@@ -4817,6 +5496,8 @@ local function tickWorld(game, player)
     end
     S.zoomExit = nil
     S.unreachable = {}
+    S.noWayOut = nil
+    DATA.rebuildTrapPenalty(game)
     S.sellActive, S.sellRole = nil, nil
     S.buyActive, S.buyRole = nil, nil
     S.discActive, S.discRole = nil, nil
@@ -4832,6 +5513,17 @@ local function tickWorld(game, player)
     })
     S.lastWorld = name
     dumpMap(game, "enter")
+    if CFG.peaceful then
+      local n = peacefulSweep(game, player)
+      log("peaceful: sent %d hostiles away on %s (keys kept: %d)", n,
+        tostring(name), S.peacefulKeys or 0)
+      ev("peaceful", { world = name, away = n, keys = S.peacefulKeys or 0 })
+    end
+  end
+
+  if CFG.peaceful and now() - (S.peacefulAt or 0) > 1 then
+    S.peacefulAt = now()
+    peacefulSweep(game, player)
   end
 
   -- The game owns the player for the whole ferry cutscene; just wait it out.
@@ -4853,17 +5545,10 @@ local function tickWorld(game, player)
     S.entered = true
     S.dungeonName = name
     S.phase = "dungeon"
-    local wd
-    pcall(function() wd = player:getMeleeWeaponData() end)
-    local inv = {}
-    pcall(function()
-      for _, o in pairs(game:getPlayerInventory() or {}) do
-        inv[#inv + 1] = string.format("%s x%s", tostring(o.objectType), tostring(o.count or 1))
-      end
-    end)
+    local weapon, invSummary = enteredBanner(game, player)
     log("entered dungeon %s (%s) weapon=%s inv=[%s] poise=%s/%s",
       tostring(name), tostring(data.dungeonType),
-      tostring(wd and wd.objectType or "none"), table.concat(inv, ", "),
+      tostring(weapon), invSummary,
       tostring(player.poise), tostring(player.maxPoise))
   end
 
@@ -4914,32 +5599,42 @@ local function tickWorld(game, player)
       tourRemove(name)
     end
 
+    -- S.tag names the town step that claims this tick, so the beat line says
+    -- who is holding the wheel when a town phase stops making progress.
+    S.tag = "grievance"
     -- A grievance from an accidental bump blocks the exit and the inn; pay it
     -- before anything else spends money.
     if grievanceStep(game, player) then return end
 
     -- Boons first: offerings, Gifts and dedication only happen in safe towns.
+    S.tag = "god"
     if godStep(game, player) then return end
 
     -- P2: wear the best allowed gear before selling, so the sell protection
     -- sees the final build. Behind ZZBOT_GEAR=1 until verified headless.
+    S.tag = "equip"
     if equipStep(game, player) then return end
+    S.tag = "lamp"
     if lampStep(game, player) then return end
 
     -- Sell surplus loot before leaving town; the ferry purse depends on it.
+    S.tag = "sell"
     if sellStep(game, player) then return end
 
     -- Spend gold on unseen potion and wand types: each new type feeds the
     -- discovery Devotional Tasks, and their rewards are Gifts (+5 stat each).
+    S.tag = "discovery"
     if discoveryStep(game, player) then return end
 
     -- Then reload the bag with goods this town prices low: the next towns on
     -- the route pay up to twice as much once their own demand is factored in.
+    S.tag = "trade"
     if tradeBuyStep(game, player) then return end
 
     -- The ferry is the only way on or off the Barrow-Linn isle. Sail from the
     -- Moon-upon-Thoss gate when the route points at Barrow-Linn, and from the
     -- dock town when the route points anywhere else.
+    S.tag = "town-tail"
     local wantSail = (name == "Moon-upon-Thoss" and S.nextTown == "Barrow-Linn")
       or (name == "Barrow-Linn-Ferry" and S.nextTown ~= "Barrow-Linn")
     if wantSail then
@@ -5056,6 +5751,9 @@ local function tickWorld(game, player)
         end
         return
       end
+      -- A sealed door must be spoken to before the final step: pressing
+      -- Return on it with the lock still in place only opens an alert.
+      if unlockEntranceStep(game, player, name, target, sx, sy) then return end
       if px == sx and py == sy then
         pressKey("return")
         return
@@ -5233,8 +5931,26 @@ local function tickWorld(game, player)
   -- danger-avoidance routing above keeps contact down when recovery is gone.
   if Loot.sweepStep(game, player) then return end
 
-  local fx, fy, steps = findFrontier(game, player)
+  local lvl = Loot.rec(game.currentWorldName)
+  local fx, fy, steps = findFrontier(game, player, lvl.blockedFrontier)
   if fx and steps and steps[1] then
+    -- A frontier that stops revealing cells is a pocket behind a window or a
+    -- one-way drop. Walking at it forever is how a sweep used to time out
+    -- without a level_done, so drop it after a grace period and replan.
+    local fk = ckey(fx, fy)
+    local fw = lvl.frontierWatch
+    if not fw or fw.k ~= fk or lvl.knownCount > (fw.known or 0) then
+      lvl.frontierWatch = { k = fk, known = lvl.knownCount, t = now() }
+    elseif now() - (fw.t or 0) > 8 then
+      lvl.blockedFrontier = lvl.blockedFrontier or {}
+      lvl.blockedFrontier[fk] = true
+      lvl.frontierWatch = nil
+      log("frontier at %d,%d yields nothing; skipping it", fx, fy)
+      ev("frontier_skip", {
+        world = game.currentWorldName, x = fx, y = fy, reason = "no_progress",
+      })
+      return
+    end
     if not Loot.lockedAhead(game, px, py, steps) then
       S.phase = "explore"
       pressDelta(steps[1].x, steps[1].y)
@@ -5263,19 +5979,49 @@ local function tickWorld(game, player)
   end
 
   -- Nothing left to see or loot on this level: record it once. Containers
-  -- annotated as locked/unreachable do not block completion; they are
-  -- reported in the event so a missing key is visible in the log.
-  local lvl = Loot.rec(game.currentWorldName)
-  if not lvl.done then
-    lvl.done = true
-    local total, pending, annotated = 0, 0, 0
+  -- annotated as locked/unreachable/stalled do not block completion; they are
+  -- reported in the event so a missing key is visible in the log. A pending
+  -- entry without an annotation is still reachable, so the level is not done
+  -- yet: the full-loot rule says the sweep simply has not got to it.
+  local total, pending, annotated, blocking = 0, 0, 0, 0
+  for _, c in pairs(lvl.containers) do
+    total = total + 1
+    if c.state == "pending" then
+      pending = pending + 1
+      if c.problem then annotated = annotated + 1 else blocking = blocking + 1 end
+    end
+  end
+  if not lvl.done and blocking > 0 then
+    -- Reachable loot is outstanding but every layer above declined. Silence
+    -- here is the expensive failure mode, so say what the nearest blocked
+    -- target is and why, once every few seconds.
+    local best, bestLen
     for _, c in pairs(lvl.containers) do
-      total = total + 1
-      if c.state == "pending" then
-        pending = pending + 1
-        if c.problem then annotated = annotated + 1 end
+      if c.state == "pending" and not c.problem then
+        local cs = Loot.plan(game, player, c.x, c.y)
+        if cs and (not bestLen or #cs < bestLen) then best, bestLen = c, #cs end
       end
     end
+    local idleKey = string.format("%s:%d,%d", tostring(name), px, py)
+    if S.idleKey ~= idleKey or S.idleAt == nil then
+      S.idleKey, S.idleAt = idleKey, now()
+    elseif now() - S.idleAt > 8 and now() - (S.idleLogAt or 0) > 8 then
+      S.idleLogAt = now()
+      local idle = math.floor(now() - S.idleAt)
+      log("idle %ds at %d,%d with %d reachable container(s) left (nearest %s at %s,%s)",
+        idle, px, py, blocking,
+        best and tostring(best.cell) or "none",
+        best and tostring(best.x) or "-", best and tostring(best.y) or "-")
+      ev("idle", {
+        world = name, x = px, y = py, idle = idle, blocking = blocking,
+        target = best and string.format("%d,%d", best.x, best.y) or "",
+        target_cell = best and tostring(best.cell) or "",
+        path = bestLen and tostring(bestLen) or "",
+      })
+    end
+  end
+  if not lvl.done and blocking == 0 then
+    lvl.done = true
     log("LEVEL DONE: %s (loot %d/%d, annotated %d, known %d, visit %d)",
       tostring(game.currentWorldName), total - pending, total, annotated,
       lvl.knownCount, lvl.visited)
@@ -5352,6 +6098,43 @@ local function tickWorld(game, player)
       annotated = annotated, idle = math.floor(t - S.stuckSince),
     })
   end
+
+  -- Nothing left to do and no way out: the floor is finished and either there
+  -- is no stairs down or the stairs sit behind a locked door whose key is not
+  -- on this level. A save that already spent the chest key (or dusted the
+  -- carrier) leaves exactly this state, so report it once and stop instead of
+  -- grinding to the harness timeout.
+  local downTrigger = findActionTrigger(game, "fnDown")
+  local stairsSealed = downTrigger and S.stairsLocked or nil
+  if lvl.done and not hasMasterKey and t - S.stuckSince > 20
+    and (not downTrigger or stairsSealed) and not S.noWayOut then
+    S.noWayOut = true
+    local reason, detail
+    if stairsSealed then
+      reason = "stairs_locked"
+      detail = string.format("stairs at %d,%d are behind %s at %d,%d",
+        downTrigger.x, downTrigger.y, tostring(stairsSealed.need),
+        stairsSealed.x, stairsSealed.y)
+    else
+      reason = "no_way_out"
+      detail = "no master key and no stairs down"
+    end
+    log("BLOCKED: %s is finished but has no exit: %s",
+      tostring(game.currentWorldName), detail)
+    ev("dungeon_blocked", {
+      world = game.currentWorldName, x = px, y = py, reason = reason,
+      item = stairsSealed and tostring(stairsSealed.need) or "",
+      chest = cx and string.format("%d,%d", cx, cy) or "",
+    })
+    S.finished = true
+    if CFG.quit then
+      S.done = true
+      love.event.quit(4)
+    else
+      S.active = false
+    end
+    return
+  end
 end
 
 local function tick(game)
@@ -5413,6 +6196,25 @@ end
 local function checkGlobal()
   if not S.active then return end
   local t = now()
+
+  -- Hard wall-clock deadline (harness). Without it a run that is soft-locked
+  -- inside a dialog or the watchdog lives past the runner's timeout.
+  if CFG.wall and (t - S.t0) > CFG.wall then
+    S.finished = true
+    S.done = true
+    local game = G_stateGame
+    local player = game and game.actorManager and game.actorManager.player
+    log("FAIL: wall-clock deadline %ds in %s at %s", CFG.wall,
+      tostring(game and game.currentWorldName or "?"),
+      player and string.format("%d,%d", player.position.x, player.position.y) or "?")
+    ev("timeout", {
+      world = game and game.currentWorldName or "", phase = S.phase,
+      wall = CFG.wall, reason = "wall",
+      x = player and player.position.x or 0, y = player and player.position.y or 0,
+    })
+    if CFG.quit then love.event.quit(3) else S.active = false end
+    return
+  end
 
   local current = GameState.current()
   if current == G_stateTitleScreen and not S.started then
@@ -5541,16 +6343,44 @@ local function checkGlobal()
       S.active = false
     end
     return
+  end  -- Stall watchdog. A step that returns true without moving the player eats a
+  -- whole scenario in silence: newgame once sat on a Moon-upon-Thoss tile for
+  -- 760 in-game seconds in phase=to-shop, and the dungeon-only stuck detector
+  -- never fired. Report it, then drop the transient session flags so the next
+  -- tick re-plans instead of holding a wedged plan forever.
+  do
+    local px, py = player.position.x, player.position.y
+    local wp = S.watch
+    if not wp or wp.world ~= game.currentWorldName
+      or wp.x ~= px or wp.y ~= py then
+      S.watch = { world = game.currentWorldName, x = px, y = py, t = t }
+    elseif t - wp.t > 25 and t - (S.stallLoggedAt or 0) > 15 then
+      S.stallLoggedAt = t
+      log("stall %ds in %s at %d,%d (phase=%s tag=%s)",
+        math.floor(t - wp.t), tostring(game.currentWorldName), px, py,
+        tostring(S.phase), tostring(S.tag))
+      ev("stall", {
+        world = game.currentWorldName, x = px, y = py, phase = S.phase,
+        tag = S.tag, idle = math.floor(t - wp.t),
+      })
+      if t - wp.t > 45 then
+        S.sellActive, S.buyActive, S.discActive = nil, nil, nil
+        S.sellRole, S.buyRole, S.discRole = nil, nil, nil
+        S.gearT, S.tradeCoolT, S.discCoolT = nil, nil, nil
+      end
+    end
   end
 
   if t - S.lastBeat > 20 then
+
+
     S.lastBeat = t
     local key = player:findInventoryObjectWithName("key_master") ~= nil
     local cx, cy = keyChestXY(game)
     local chestCell = cx and cellTypeName(cellAt(game.map, cx, cy)) or nil
     local minor, major = findHealPotion(player)
     local stone = findLifestone(player)
-    log("beat t=%ds %s turn=%s pos=%d,%d hp=%s/%s key=%s chestKey=%s chest=%s@%s,%s pot=%s/%s stone=%s phase=%s known=%d",
+    log("beat t=%ds %s turn=%s pos=%d,%d hp=%s/%s key=%s chestKey=%s chest=%s@%s,%s pot=%s/%s stone=%s phase=%s tag=%s known=%d",
       math.floor(S.activeTime), tostring(game.currentWorldName), tostring(gGameTurn),
       player.position.x, player.position.y, tostring(player.health),
       tostring(player.maxHealth), tostring(key),
@@ -5558,8 +6388,8 @@ local function checkGlobal()
       tostring(cx), tostring(cy),
       tostring(minor and minor.count or 0), tostring(major and major.count or 0),
       tostring(stone and stone.durability or 0), S.phase,
-      Loot.rec(game.currentWorldName).knownCount)
-    pcall(function()
+      tostring(S.tag), Loot.rec(game.currentWorldName).knownCount)
+    local statsOK, statsErr = pcall(function()
       local ps = game:getPlayerStats()
       local devs = {}
       for _, g in ipairs(G_Globals.skillFactions) do
@@ -5568,7 +6398,29 @@ local function checkGlobal()
       log("stats money=%s str=%s fin=%s int=%s per=%s end=%s dev=[%s] following=%s",
         tostring(ps.money), tostring(ps.strength), tostring(ps.finesse),
         tostring(ps.intellect), tostring(ps.perception), tostring(ps.endurance),
-        table.concat(devs, " "), tostring(game:getCurrentGod()))
+        table.concat(devs, " "),
+        -- getCurrentGod can return nothing (faithless run), and an empty result
+        -- inside tostring() is a hard error, not nil.
+        tostring(game.getCurrentGod and game:getCurrentGod(game)))
+    end)
+    -- A silent pcall here hid a dead observability line for a whole session, so
+    -- the first failure names itself once.
+    if not statsOK and not S.statsErrLogged then
+      S.statsErrLogged = true
+      log("stats: cannot read player stats (%s)", tostring(statsErr))
+    end
+    -- Burden from the game's own numbers: the tick multiplier is 0.8 empty and
+    -- 1.0 at max burden, so anything above 1.0 is the bot walking slower than
+    -- the pack it is running from. Logged apart from the stats line so a broken
+    -- stat read cannot hide it.
+    pcall(function()
+      local weight, maxBurden = game:getRawPlayerBurdenAndMaxBurden()
+      local mult
+      if game.getPlayerTickCostMultiplier then
+        mult = game:getPlayerTickCostMultiplier(game)
+      end
+      log("burden weight=%s/%s mult=%s", tostring(weight), tostring(maxBurden),
+        mult and string.format("%.2f", mult) or "?")
     end)
     dumpMap(game, "beat")
   end

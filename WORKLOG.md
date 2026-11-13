@@ -1,13 +1,16 @@
 # Worklog — moonring-bot
 
-Última actualización: 2026-10-27 (combate generalizado, mazmorra completada y verificada en headless).
+Última actualización: 2026-11-07 (handoff Claude para el bloqueo de descenso multi-nivel; estado: primer piso se barre, siguiente piso no entra).
 
 Objetivo: bot autónomo estilo qw para **Moonring**. Debe iniciar una partida nueva,
 llegar desde el pueblo Yarrow a **Yarrow Cave** (`firstDungeon-01`), explorarla,
 obtener la **llave maestra** (`key_master`), salir de la mazmorra y volver a Yarrow.
 
 Proyecto independiente de `qw2`, en `/home/lavilao570/Projects/moonring-bot`.
-No es un repositorio git.
+
+**Es un repositorio git** (`origin` remoto, rama `master`). El trabajo local sin
+confirmar se guarda con `git stash` antes de cualquier `git pull`; al recuperarlo
+revisar que los cambios del remoto no lo hayan dejado obsoleto.
 
 ---
 
@@ -1347,3 +1350,425 @@ Bloqueado por verificación headless (necesita el AppImage en `work/`):
 ejecución de `shoot`/`power` en el chooser, binding de skills (§8.9), nombres
 de objetos de lámpara (§8.12), predicados de reliquia (§8.4/§8.15) y el
 switch real de ruta TOWN_ORDER → planner.
+
+### Test60 — Handoff a Claude: atasco tras completar el primer piso de The Jest
+
+El reporte autocontenido para revisión externa es `CLAUDE_HANDOFF.md`. Incluye
+los extractos de bot/juego necesarios, configuración de pruebas, secuencia de
+eventos, límites de lo observado y preguntas precisas; no requiere acceso al
+repositorio para leer el diagnóstico.
+
+Estado verificado antes del último cambio en `Loot.stairsStep`:
+
+- `tools/unit.sh`: todas las pruebas unitarias pasan.
+- `tools/regress.sh dungeon`: barre 19/20, marca `level_done` a t=163.7 s y
+  termina con `dungeon_blocked reason=no_way_out` a t=183.75. El save sintético
+  no tiene `chest_key`/portador ni `fnDown`, así que no es una prueba de salida.
+- `tools/regress.sh jest`: la contraseña `Death Has Dominion Over All` se grita,
+  abre la puerta y se entra en `dungeon2-01`; luego vence el timeout de 120 s
+  durante loot. Prueba la entrada, no la escalera multi-nivel.
+- `tools/regress.sh jest-multilevel` con `PEACEFUL=1`: entra en `dungeon2-01`,
+  aparta 29 hostiles, barre 8/8 contenedores y emite `level_done` a t=155.9 s.
+  Después permanece en `dungeon2-01`, (42,43), `cell=dungeonBridge_ew`,
+  `phase=descend`, hasta timeout t=601.85 s. No hay segundo `level_enter`.
+- El único cambio posterior fue una hipótesis no verificada en `Loot.stairsStep`
+  sobre no pulsar Return si el root ya es `stairsDown`/`stairsUp`. El log no
+  contiene el target real de `fnDown`, así que no atribuir la falla a esa rama.
+  Próximo paso indicado en `CLAUDE_HANDOFF.md`: instrumentar target/trigger,
+  roots y resultado de `navigateOrOpenDoor` antes de cambiar más la interacción.
+
+No se ha hecho commit. No afirmar aún que el flujo multi-nivel funciona.
+
+### Test59 — Post-pull: ports del WIP local, atascos y armas arrojadizas
+
+Estado del repositorio al empezar esta sesión: el árbol local tenía trabajo sin
+confirmar (P1/P2: `peaceful`, deadline de reloj de pared, arreglo de lámpara,
+watchdog de atasco, arnés con `START_TOWN`/`MAPDUMP`/`PEACEFUL`). Para poder
+`git pull --ff-only` se guardó en `git stash` (`WIP local antes del pull
+2026-11-03`) y el remoto avanzó de `ed5eeda` a `563d461` con P8/P8b/P9/P9b y los
+módulos extraídos (`metrics`, `confirm`, `dialogue`, `gear`, `gods`, `taboo`,
+`powers`, `campaign`, `travel`, `knowledge`, `trace`) más `tools/unit.sh`.
+
+Lo que el remoto ya traía: ledger de contenedores, barrido completo, escaleras,
+ruta estricta, `level_done`, capa de equipo, lámpara tras `ZZBOT_LAMP`. Lo que el
+remoto **no** traía y se ha portado desde el stash (verificado con
+`luajit -e loadfile` y `tools/unit.sh` en verde):
+
+- **Deadline de reloj de pared** `ZZBOT_WALL` en `checkGlobal`: el timeout de
+  juego solo corre mientras el bot tiene el tick, así que un run bloqueado en un
+  diálogo o en el watchdog podía superar el `timeout` del arnés y quedarse vivo.
+  Emite `timeout reason=wall` y sale con código 3.
+- **`ZZBOT_PEACEFUL=1`** (solo pruebas): al entrar a un nivel manda a casa a
+  todos los hostiles (`isAway`), y repite el barrido cada segundo para los
+  guardianes que aparezcan después. Permite medir barrido/descenso sin que el
+  resultado lo decida el combate. `tools/regress.sh` lo pasa junto con
+  `ZZBOT_START_TOWN`, `ZZBOT_MAPDUMP` y `--kill-after=20s`.
+- **Lámpara (P2)**: `game:toggleInventoryID` no existe; la API real es
+  `player:toggleInventoryID("lampInventoryID", id)` y luego
+  `game:updateLampStatus(...)` para recalcular vista/FOV. Además el estado se lee
+  del juego (`player.lampInventoryID`), no de `S.lampOn`, porque el juego apaga
+  la lámpara al agacharse y la vuelve a encender al levantarse. Si el toggle no
+  cambia la ranura se emite `amber_state state=toggle_failed` con backoff de 30 s
+  en vez de reintentar en silencio (causa de la ráfaga de `lamp: lit` del log).
+- **Frontera sin progreso**: `findFrontier(game, player, blocked)` acepta celdas
+  bloqueadas y el llamador aplica una gracia de 8 s sin celdas nuevas antes de
+  anotarla (`frontier_skip reason=no_progress`). Es el caso de un bolsillo tras
+  una ventana o una caída de un solo sentido.
+- **Tope de atasco del barrido**: el contenedor elegido que no acorta su plan en
+  20 s se anota `container_skip reason=stalled` y se replanifica, en lugar de
+  embestirlo hasta el timeout.
+- **Regla de botín completo aplicada de verdad**: `level_done` ya no se emite
+  mientras quede algún contenedor pendiente **sin** anotar (bloqueante). Se
+  cuentan `looted/containers/annotated` y, si quedan bloqueantes y todas las
+  capas declinan, se emite `idle` cada 8 s con el objetivo más cercano y su
+  longitud de camino. Antes la cima del tick podía declarar el nivel terminado
+  con contenedores alcanzables sin abrir.
+
+Armas arrojadizas (pregunta del usuario): **no es una decisión del modelo, es una
+carencia**. `combatStep` solo golpea en cuerpo a cuerpo y `playerProfile` calcula
+`dps` únicamente con `getTotalPlayerMeleeAttackStatsAfterEquipmentDegradation`,
+así que nunca se comparan opciones a distancia. En el juego sí existen
+(`throwing_stones`, `throwing_daggers`, `throwing_pins` son `category = "ranged"`
+con `distance` y `showArc`), y el inventario inicial ya trae 10 piedras que el bot
+nunca usa; la capa de venta solo conserva un arma a distancia y su munición
+(`hasRangedWeapon`). Para usarlas hay que entrar en el flujo de apuntado
+(`pendingActionData` + `targetedOffset` + `performPendingActionAtTargetLocation`)
+o llamar la acción `rangedWeapon`; queda como trabajo de P5 (modelo v2) y no como
+un bug de la lógica de daño actual.
+
+En curso: `tools/regress.sh dungeon` y `tools/regress.sh jest-multilevel` (este
+último con `PEACEFUL=1`) sobre el build nuevo.
+
+### Test60 — P1 cerrado hasta donde se puede sin equipo; P2: el adaptador de equipo puntuaba cero
+
+**The Jest (P1) queda aparcado a propósito.** El grito del Jest está verificado
+(`yell@dungeon=dungeon2-01`, `entrance_unlocked`) y el descenso multinivel
+funciona: piso 1 barrido 8/8 (`level_done` a t=240, known=3174) y bajada a
+`dungeon2-02`. Lo que mata las runs no es la estrategia de barrido, es el
+contenido: cada trampa o pincho que sube quita el **25% de la vida máxima**
+(`actor.lua:8170 hitBySpikes`), así que cuatro golpes matan incluso al personaje
+de prueba de 200 000 HP. Un piso 2 de la mazmorra de reliquias se juega con el
+equipo de P2/P4 y el modelo de P5; insistir ahora es hacer el examen difícil
+antes del fácil.
+
+Lo que sí se dejó implementado y en verde (sintaxis, `tools/build.sh`,
+`tools/unit.sh`):
+
+- **Celdas peligrosas en el pathfinder**: agujeros (`trapdoorClosed`,
+  `trapdoorOpen`, `void`) y trampas visibles (`fireTrap*`, `amberTrap*`) como
+  muro (`DATA.HAZARD_CELLS` / `DATA.HAZARD_PREFIXES` / `DATA.isHazardCellName`).
+  Los pinchos **no** se bloquean: el juego los cicla y hay salas enteras
+  cubiertas; bloquearlos dejaba el barrido en 6/8 y `stuck`.
+- **Trampas ocultas** (`fnTrap`): no son celdas, son triggers encima de suelo
+  normal. Se penalizan en `weightedSteps` (`DATA.TRAP_PENALTY`,
+  `DATA.TRAP_STEP_COST = 60`, `DATA.rebuildTrapPenalty(game)` al cambiar de
+  mundo), así que la ruta las bordea cuando puede y las cruza cuando es el
+  único pasillo.
+- **Ciclo de pinchos** (`DATA.isSpikeCellName`, `DATA.spikesUp`,
+  `DATA.spikeDownTurns`, `DATA.spikeGuard`): suben en los turnos 1-2 y 11-12 de
+  cada 24 (`state_game.lua:8886`). El bot solo entra en una tirada de celdas de
+  pinchos si la ventana de bajada cubre la tirada completa, y si le pilla encima
+  se aparta a una celda sólida antes de que suban. Penalización suave (+8) para
+  preferir suelo firme.
+- **Escaleras tras puerta no abrible**: `Loot.stairsStep` responde
+  `stairs_locked` (rc=4) en vez de embestir la puerta.
+- **`PEACEFUL` no pierde llaves**: al mandar a casa a un hostil transfiere
+  `carryingObject` al jugador antes de marcarlo `isAway`.
+- **Subir fuera del Jest es P6**: exige `key_master`, premio del boss del piso 7.
+  Por eso `jest-multilevel.conf` ya no pide salir; pide `level_done@world=dungeon2-01`,
+  `level_done>=2`, `level_enter@from=dungeon2-01`, `!death`, `!alert_stuck`,
+  `!confirm_unknown`, `!stairs_stall`, `!stairs_failed`. Hoy falla por muerte en
+  `dungeon2-02` (`floorSpikesOn*`) y se deja como escenario de diagnóstico, no
+  como puerta de P1.
+
+**P2 — bug real encontrado en el adaptador de equipo.** `gearRecord` leía
+`def.damage`, `def.defense`, `def.burden`, `def.might` y `def.block`, columnas
+que **no existen** en `data/ObjectData - Sheet1.csv`; el juego usa
+`physicalMeleeDam`/`magicalMeleeDam`, `physicalDef`/`magicalDef`,
+`shieldBlockFraction`, `weight` y `weaponTimeCost`. Resultado: todos los
+registros puntuaban 0 y `Gear.planEquip` nunca proponía un cambio — la capa de
+equipo parecía instalada y era inerte.
+
+- La conversión vive ahora en `gear.fromObjectData(o, def)` (pura y con tests) y
+  `init.gearRecord` solo le añade `identified`. `zzbot.gear` prefiere
+  `DPS_Calculation` cuando el juego lo expone y si no cae a
+  `damage / timeCost`.
+- La armadura se puntúa como defensa por **peso** (no hay columna de burden;
+  el peso es lo que el juego cobra al cargar).
+- Las armas a distancia se vetoadas en el plan hasta P5: `combatStep` solo
+  embiste, así que un arco en la mano es pérdida neta de daño.
+- Diagnóstico: una vez por nivel, `gear: no upgrade among N wearable records
+  (M vetoed)`. En la run de `newgame` sale `5 wearable records (1 vetoed)`, que
+  es la prueba de que el adaptador ya puntúa.
+- `tools/regress.sh` pasa `ZZBOT_GEAR` (por defecto `1`, se puede apagar con
+  `GEAR=""` en el `.conf`), así que el arnés por fin ejerce la capa de equipo.
+
+**Bug propio encontrado en la verificación (ya corregido).** El primer intento de
+`DATA.spikeGuard` se llamaba sin `px, py`, así que `cellAt(map, nil, nil)`
+reventaba en cada tick de `moveToward`: el `pcall` del hook tragaba el error una
+vez (`S.errLogged`) y el bot se quedaba clavado en la cama de Yarrow 900 s
+(`newgame` en rojo). Ahora `moveToward` pasa las coordenadas y `spikeGuard`
+ignora la llamada si no son números; `cellAt` devuelve `nil` en vez de petar,
+para que una celda fuera de mapa sea "no transitable" y no un tick perdido.
+
+**Segundo y tercer cuelgue: `pressDelta` con un delta que no es unitario.**
+Con los dos bugs anteriores corregidos, `newgame` volvió a pasar una vez y
+después se quedó otros 760 s parado en `Moon-upon-Thoss` en `phase=to-shop`
+(32,63, hp 37/400). La causa de la familia: `doFlee` tomaba la celda que
+devuelve `desperateEscapeCell` y la pasaba como si fuera un delta
+(`pressDelta(50, 71)`), y `pressDelta` solo entiende ±1/0, así que **no pulsaba
+nada** y devolvía `false` mientras `doFlee` devolvía `true`: bucle infinito.
+Igual en `walkNextToActor`, que ignoraba el resultado de `pressDelta`. Ahora:
+
+- el fallback de `doFlee` calcula el delta contra `player.position`;
+- `doFlee` y `walkNextToActor` devuelven `false` si `pressDelta` falla, con un
+  log único (`flee: no unit direction ...` / `shop: walkNextToActor cannot press ...`).
+- **Watchdog de atasco para todos los mundos** (el detector `stuck` existente
+  solo miraba mazmorras): si la posición no cambia en 25 s de juego, loguea
+  `stall Ns ... (phase=..., tag=...)` + evento `stall` cada 15 s, y a los 45 s
+  limpia los flags de sesión (`sellActive`/`buyActive`/`discActive` y sus
+  cooldowns) para que el siguiente tick replanifique en vez de arrastrar un plan
+  atascado. La línea `beat` ahora incluye `tag=`, que nombra el paso de pueblo
+  que se está quedando con el turno.
+
+**Lo que queda en `newgame` es combate, no cuelgue.** Con el watchdog puesto, las
+siguientes runs ya no se congelan: mueren. Dos seguidas en `firstDungeon-01`
+(t=37 y t=61, junto al cofre de 68,32), con `v=avoid` en el modelo, `need` >
+`res` (necesita 811 y le quedan 21) y sin pociones: el pack de escarabajos +
+avispas pega 380 de daño en un solo turno (109, 270 y 132 por mordisco con
+armadura bloqueando 9-11), y la rama `avoid` no encuentra celda de retirada, así
+que cae al `bump` y pelea. Eso es doctrina de P5 (no entrar en la sala, curar
+antes del contacto, retirada con hueco real), no un bug de pathfinding. El
+`newgame` es, por tanto, **flaky por potencia de combate**, no por atasco.
+
+Pendiente de P2: escalera de burden sin consumidor (el peso solo limita las
+compras de arbitraje) y el trato de objetos sin identificar.
+
+### Test61 — P2 §3.2: curas de estados (data-driven)
+
+El catálogo de curas no está en el código del juego como lista de objetos, sino
+en `G_Globals.cureStates` (efecto → bandera de estado) y en la columna `useFX1`
+de `ObjectData`; el inventario expone `findInventoryObjectWithUseFX`, que ya se
+usaba para el Lifestone. Con eso la política queda data-driven, sin nombres de
+objeto cableados:
+
+| fx | objeto | estado |
+|---|---|---|
+| `cure_bleed` | Bandage | `isBleeding` |
+| `cure_flame` | Water | `isAflame` |
+| `cure_poison` | Antidote | `isPoisoned` |
+| `cure_rot` | Sera-leaf Oil | `isRotting` |
+| `cure_stun` | Acitra Nectar | `isStunned` |
+| `cure_torpor` | Blackwater Draft | `isTorpid` |
+| `cure_blind` | Sightsalve | `isBlind` |
+| `cure_mad` | Bitterleaf Brew | `isMad` |
+| `cure_deafness` | Silentsalve | `isDeaf` |
+| `cure_all` | Arnaut's Panacea | cualquiera |
+
+(De paso: los nombres que se suponían en el plan, `potion_water` y
+`potion_cure_blindness`, no existen; son `Water` y `Sightsalve` con ese `useFX1`.)
+
+- `Gear.curePlan(statuses, stock)` (puro, en `gear.lua`): elige el **cure
+específico** antes que la panacea; `cure_all` solo cuando limpia 2+ males, o
+cuando el único mal **drena vida por turno** (sangrado, fuego, veneno, podredumbre)
+y no hay específico. Orden de gasto: drenantes primero, luego stun/torpor
+(pierden el turno), ceguera, locura y sordera al final (la sordera solo silencia
+líneas de NPC). Ni `isWet`/`isOily` ni las pociones-trampa (locura, aturdimiento,
+veneno) entran en la lista: no se usan nunca.
+- `DATA.cureStep(game, player)` en `init.lua`, llamado al principio de `tryHeal`
+(antes de la comprobación de HP, porque sangrar bloquea la regeneración y se
+come lo que curaría una poción). Escanea el inventario con `DATA.cureStock`, se
+niega a usar nada si el estado no está activo (regla de no desperdiciar), emite
+`EV|kind=cure|fx=...|ailment=...` por uso y `nocure` (máx. cada 15 s) cuando el
+mal no tiene remedio en la mochila.
+- **Gancho P4**: antes de usar, `Taboo.check(profile, "heal", {itemType, category})`;
+si el dios lo prohíbe (Dust con pociones/ungüentos), deja el objeto y emite
+`taboo_block kind=heal`.
+- Tests nuevos en `tools/test_gear.lua`: nada se gasta sin mal activo, específico
+antes que panacea, panacea con 2 males, panacea no se gasta en sordera ni en
+locura solas, sí en un drenante sin específico, y drenante antes que cosmético.
+
+Verificado: sintaxis, `tools/build.sh`, `tools/unit.sh` (todo verde) y
+`tools/regress.sh smoke yarrow` PASS. En el log del smoke sale el camino nuevo
+funcionando: el jugador empieza `torpid` y el bot emite
+`cure: nothing in the pack for torpid` + `EV|nocure|ailment=torpid` una sola vez.
+
+**Burden: el juego no permite tirar objetos.** Buscando consumidor para
+`Gear.dropLadder` apareció que el inventario solo pierde objetos por uso
+(`destroyOnUse`), venta (`sell_panel.lua`) o consumo en crafteo (`actions.lua`);
+el único `drop` es el comando de consola `console_drop`, que **crea** un objeto
+nuevo en el suelo y no quita el original. Así que el escalón 2 del plan (tirar
+lo de peor valor/peso) no es ejecutable y la escalera se queda como política
+pura, sin consumidor, a propósito: el peso se gestiona **no comprando** y
+vendiendo. Anotado en `PLAN.md` §3.2.
+
+Sí se añadió la observabilidad que faltaba: cada `beat` escribe
+`burden weight=W/MAX mult=X` usando los números del propio juego
+(`getRawPlayerBurdenAndMaxBurden` y `getPlayerTickCostMultiplier`; 0.8 vacío,
+1.0 al máximo, >1.0 por encima). En el arranque del smoke: 14/40 → 0.87.
+
+**Bonus: la línea `stats` estaba muerta desde siempre.** Estaba dentro de un
+`pcall` que se comía el fallo, y el fallo era real:
+`tostring(game:getCurrentGod())` revienta cuando el jugador aún no sigue a nadie
+(un resultado vacío en posición de argumento no es `nil`, es error). Ahora se
+lee con `game.getCurrentGod and game:getCurrentGod(game)` y el `pcall` loguea
+`stats: cannot read player stats (...)` una sola vez si vuelve a romperse. Con
+eso ya se ven dinero y devociones por dios (`money=520`, todos a 0 al empezar),
+que es justo lo que P4 va a necesitar.
+
+Verificado tras estos cambios: sintaxis, `tools/build.sh`, `tools/unit.sh` y
+`tools/regress.sh smoke` PASS; `yarrow` re-lanzado por el cambio en `tryHeal`.
+
+**Objetos sin identificar.** `planEquip` ya marcaba `identified = false` en la
+entrada del plan, pero el umbral era el mismo que para el equipo conocido. Ahora
+un candidato sin identificar necesita **2.0x** la puntuación actual (frente a
+1.15x de uno conocido), y el `equipStep` que ya logueaba `, unidentified` emite
+`eq|unidentified=true`. Dos tests nuevos: un 1.3x sin identificar se rechaza, un
+salto grande se acepta y se marca. Sigue abierto qué hace `isItemInert` con un
+objeto maldito puesto (no hay ejemplo en el juego todavía).
+
+Con esto P2 §3.2 queda cerrado salvo ese detalle: candidatos, puntuación,
+verificación por números del juego (equipar solo en contexto seguro, un cambio
+por tick), identificación conservadora, curación data-driven y burden medido.
+
+Verificación final: sintaxis, `tools/build.sh`, `tools/unit.sh` y
+`tools/regress.sh smoke` + `yarrow` en verde.
+
+## Test62 — Re-evaluación del plan y A/B del modelo Monte Carlo (2026-11-12)
+
+**Petición:** re-evaluar `PLAN.md` contra el estado real del bot, y hacer algo con
+el motor de combate nuevo y con la feature de aprendizaje, que hasta ahora no se
+habían tocado.
+
+### Lo que el plan suponía y lo que hay
+
+`PLAN.md` se escribió sin acceso al repo y por eso pedía construir cosas que ya
+existen: `model.lua` (816 líneas de Monte Carlo del reloj de combate, con
+`shoot`/`power` simulados), `knowledge.lua` (ledger Beta por enemigo y banda),
+`trace.lua` + `postmortem.lua`, `evolve.lua`, y los módulos de pueblo
+(`dialogue`, `gods`, `taboo`, `powers`, `campaign`, `travel`). También ignora
+que P8/P8b/P9 existen. La tabla de fases no distinguía "módulo escrito" de
+"capacidad viva", y ahí está todo el hueco: cinco flags siguen en 0
+(`ZZBOT_MODEL`, `ZZBOT_LEARN`, `ZZBOT_DIALOGUE`, `ZZBOT_POWERS`,
+`ZZBOT_CAMPAIGN`), así que el bot que corren los escenarios es esencialmente el
+de P1/P2.
+
+`PLAN.md` ahora abre con §0.0 (estado verificado), reordena las fases
+(P5 = arreglar el punto de decisión; nueva P5b = aprendizaje con datos; después
+P6/P7) y añade V0–V4 como trabajo inmediato: medir, arreglar el modelo, cablear
+ranged/poderes, generar datos de aprendizaje, apagar/encender flags.
+
+### A/B: el modelo tal como está cableado es peor
+
+Para poder medirlos añadí passthrough a `tools/regress.sh`: `MODEL=1` y
+`LEARN=1` exportan `ZZBOT_MODEL`/`ZZBOT_LEARN` y guardan el ledger aprendido
+dentro del XDG del escenario (`ZZBOT_KNOWLEDGE`), para que un run no enseñe al
+siguiente. Mismo save (`save-dungeon-start`), mismo `TIMEOUT=300`:
+
+| Run | Resultado |
+|---|---|
+| `tools/regress.sh dungeon` | **PASS**: `level_done` 19/20 a t=276, sin muerte, sale por `dungeon_blocked reason=chest_key_missing` |
+| `MODEL=1 LEARN=1 tools/regress.sh dungeon` | **FAIL**: muerte a t=178 en 41,22 (`bones`), sin `level_done` |
+
+**El modelo no predijo mal: predijo bien y aun así murió.** La traza muestra
+`hp=142/400`, poise 55, un hornet adyacente: `hit` con `pDeath=0.98`,
+`flee` con `pDeath=1.00`; eligió `hit` ("minimise risk") y alternó hit/flee
+durante diez turnos hasta morir. Son tres defectos de integración, no del
+simulador:
+
+1. `chooseEval` no tiene repliegue: si la mejor opción está al 98% de muerte, la
+   ejecuta igual, en vez de ceder el tick a la capa `avoid`/kite que en el
+   baseline es la que sobrevive.
+2. El modelo solo se consulta con `#adj > 0`, ya en contacto, donde huir es
+   matemáticamente peor que pelear. La decisión que salva vidas (alejarse antes)
+   vive en la capa de movimiento y el modelo no la puede elegir.
+3. Desempate: a igual riesgo gana el que menos recursos gasta, y atacar cuesta 0.
+
+Y el hueco que ya sabíamos: `buildCombatOptions` no ofrece `shoot` ni `power`,
+así que el "modelo v2" que el WORKLOG daba por completo (Test53) está simulado
+pero nunca propuesto. `tools/test_model.lua` tampoco tiene casos de `shoot` ni
+de `power`.
+
+### Aprendizaje
+
+`knowledge fresh: 0 deaths, 0 kills, 0 enemy kinds` es literalmente lo único que
+se ve en los logs: ningún run ha escrito ledger, y el multiplicador no se aplica
+hasta 5 observaciones por banda, así que hoy la feature es inerte. Dos cosas
+más que se ven en la evidencia: `death ... by=nil` (la atribución del asesino
+falla, y el ledger necesita `by=` para mover el multiplicador correcto) y el
+ledger entra por `threatList`, o sea que también modula la heurística, no solo
+el modelo. Queda como V3 en el plan, con la biblioteca de escenarios letales
+(save unos segundos antes de cada muerte) para que el GA pueda puntuar sin
+esperar 15 minutos por genoma.
+
+### Verificación
+
+Sintaxis, `tools/build.sh`, `tools/unit.sh`, `tools/regress.sh dungeon` (PASS,
+baseline) y el A/B documentado arriba. No toqué el save jugable: ambos runs van
+en `work/xdg-regress/dungeon`.
+
+## Test63 — Ataque a distancia cableado: `r` → `rangedWeapon` (2026-11-13)
+
+### El mecanismo real (leído en el fuente del juego)
+
+No existe una acción `shoot` aparte: la tecla `r` (`G_Globals.keyRanged`) solo
+pone `IM_INPUT.ranged`, y `state_game.lua:4033` traduce eso en
+`getFiringErrors()` + `playerInitiatingAction("rangedWeapon",
+player:getFinalPlayerRange())`. La acción `rangedWeapon` de
+`CActions.static.data` es `targetingType="location"`, `radius=1`,
+`timeCost=12`, `isBlockedByWalls=true`; `getFiringErrors` exige la skill
+usable, `player.rangedInventoryID ~= 0` y
+`player:getAmmoForCurrentRangedWeapon() > 0`. O sea: overlay de apuntado aparte,
+el disparo es una acción de ubicación que consume la munición de la pila
+equipada. Al empezar la partida hay `throwing_stones` x10 en el slot ranged.
+
+### Cambios
+
+- `DATA.rangedInfo(game, player)`: rango efectivo con `getFinalPlayerRange()`
+  (3 con las piedras, no el 4 de la tabla), munición, daño medio con
+  `CActions.getRangedAverageDamage` (8 con `throwing_stones`), `time` de
+  `weaponTimeCost`.
+- `DATA.rangedTargets`: enemigos dentro de rango **con** `getLOMToWorldXY`
+  despejado. Lo usan la lista de opciones y la ventana de decisión, para que la
+  ventana no se abra con un muro de por medio (con solo la distancia se abría y
+  no quedaba más que `wait-poise`: el run se quedó esperando 90 s).
+- `buildCombatOptions`: nueva opción `shoot` (target del pack, `damage`, `time`,
+  `range`), con coste de recurso 0.05 porque la munición es finita.
+- `executeChoice`: fija `targetedOffset` y llama a
+  `performPendingActionAtTargetLocation({id="rangedWeapon", ...})`; loguea
+  `EV|kind=shoot|target=…|dist=…|dmg=…|range=…`.
+- `equipStep`: el veto `ranged combat not implemented (P5)` pasa a ser
+  `ranged unused without the model`. Melee y ranged son slots distintos, así que
+  llevar arma a distancia no cuesta daño cuerpo a cuerpo, pero con
+  `ZZBOT_MODEL=0` la heurística nunca dispara y equiparla solo alteraría el run
+  por defecto.
+- La rama del modelo se abre sin adyacentes **solo** si hay un `shoot` posible.
+- `tools/test_model.lua`: dos casos nuevos (a 3 casillas `shoot` mata y `attack`
+  no; fuera de `range` no mata).
+
+### A/B (mismo save, `TIMEOUT=300`, Yarrow Cave)
+
+| Run | Resultado | Disparos |
+|---|---|---|
+| baseline `tools/regress.sh dungeon` (Test62) | PASS (19/20, t=276, `chest_key_missing`) | 0 |
+| `MODEL=1` | **PASS** (19/20, t=274) | **19** (dist 1–3, `dmg=8`) |
+| `MODEL=1 LEARN=1` | FAIL: timeout con 19/20, luego muerte a t=186 | 18 / 13 |
+| baseline, tres repeticiones de hoy | timeout con 19, 14 y 17 contenedores, sin muerte | 0 |
+
+El baseline vive al filo del `TIMEOUT`: pasa a t=276 de 300. Las tres
+repeticiones de hoy no son regresión del cambio — el camino sin modelo no
+ejecuta nada nuevo (`DATA.rangedInfo`/`DATA.rangedTargets` solo se llaman
+desde la rama del modelo y el veto de equipo vuelve a ser el mismo para
+`ZZBOT_MODEL=0`); es el margen del escenario, y conviene subir `TIMEOUT` o
+aceptar 19/20 en `dungeon`.
+
+Los dos fallos con `LEARN=1` no son del disparo: uno fue el atasco de
+`wait-poise` (corregido con la comprobación de LOS) y el otro la muerte de
+siempre — todas las opciones de contacto a `pDeath=98–100%` y el chooser
+ejecuta `hit` igual, porque **sigue sin existir la válvula de repliegue**
+(V1a del plan). El modelo predice bien; el punto de decisión no sabe rendirse.
+
+### Verificación
+
+Sintaxis, `tools/build.sh`, `tools/unit.sh`, `luajit tools/test_model.lua` y los
+runs de arriba en `work/xdg-regress/dungeon` (save jugable intacto).
